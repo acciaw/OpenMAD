@@ -2,9 +2,9 @@
 
 [![Logo](assets/logo.png)](https://sisyphe.acciaw.me)
 
-[![Static Badge](https://img.shields.io/badge/License-CC%20BY--SA%204.0-blue)](https://creativecommons.org/licenses/by-sa/4.0/?ref=chooser-v1)
+[![Static Badge](https://img.shields.io/badge/License-GNU%20GPLv3-green)](https://creativecommons.org/licenses/by-sa/4.0/?ref=chooser-v1)
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Platforms](https://img.shields.io/badge/Platforms-Windows-lightgrey)]()
+[![Platforms](https://img.shields.io/badge/Platform-Windows-lightgrey)]()
 
 A local driver for the **MAD68 HE** magnetic-switch keyboard, replacing the
 web-only configurator at `hub.fgg.com.cn`.
