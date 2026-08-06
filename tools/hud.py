@@ -23,7 +23,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from mad68.hud import serve  # noqa: E402
 
-REPO = Path(__file__).resolve().parent.parent
+if getattr(sys, "_MEIPASS", None):
+    REPO = Path(sys._MEIPASS)
+else:
+    REPO = Path(__file__).resolve().parent.parent
 
 
 def main() -> int:
