@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Build output
+build/
+dist/
+*.spec.bak
+packaging/Output/
+packaging/*.exe
+
+
+research/
+
+# Local state, different on every machine
+profiles/
+backups/
+switcher.json
+settings.json
+switcher.log
+onboard.json
+*.log
+
+# Development scratch, not part of the shipped app
+dev/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
