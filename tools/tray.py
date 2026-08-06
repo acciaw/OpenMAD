@@ -35,7 +35,13 @@ from mad68.switcher import (  # noqa: E402
     foreground_app,
 )
 
-REPO = Path(__file__).resolve().parent.parent
+# When packaged as an exe, PyInstaller provides sys._MEIPASS pointing to the bundle.
+# Assets are extracted to this location. In development, resolve relative to the repo.
+if getattr(sys, "_MEIPASS", None):
+    REPO = Path(sys._MEIPASS)
+else:
+    REPO = Path(__file__).resolve().parent.parent
+
 PROFILE_DIR = REPO / "profiles"
 CONFIG_PATH = REPO / "switcher.json"
 LOG_PATH = REPO / "switcher.log"
