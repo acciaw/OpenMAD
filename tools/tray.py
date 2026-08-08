@@ -153,6 +153,9 @@ class TrayApp:
         # The configurator's HTTP server, served from this process.
         self._httpd = None
         self._sampler = None
+        # Set once the startup check finds a newer release, so the menu can
+        # offer it and the tooltip can mention it.
+        self.update_info: dict | None = None
         self.icon = pystray.Icon(
             "mad68",
             make_icon(self.state),
@@ -307,10 +310,50 @@ class TrayApp:
                                           self._apply_keymap))
 
         items.append(pystray.Menu.SEPARATOR)
+        # Only present when there is actually something newer. The click opens
+        # the configurator, which is where the download and install live.
+        if self.update_info:
+            items.append(pystray.MenuItem(
+                f"Update to {self.update_info.get('latest', '')}…",
+                self._open_hud))
         items.append(pystray.MenuItem("Open", self._open_hud, default=True))
         items.append(pystray.MenuItem("Re-read config", self._reload_config))
         items.append(pystray.MenuItem("Quit", self._quit))
         return pystray.Menu(*items)
+
+    def _check_for_update(self) -> None:
+        """Ask GitHub once, a few seconds after startup.
+
+        Deferred rather than run inline: the tray icon should appear
+        immediately, and a network call on a machine that wakes up without a
+        connection would otherwise hold that up for the whole timeout. Silent
+        unless there is something to say -- a balloon on every launch saying
+        "up to date" is noise.
+        """
+        self._stop.wait(8.0)
+        if self._stop.is_set():
+            return
+        try:
+            settings_path = DATA_DIR / "settings.json"
+            from mad68.settings import AppSettings
+            if not AppSettings.load(settings_path).check_updates:
+                return
+            from mad68.hud import check_for_update
+            info = check_for_update()
+        except Exception:
+            return  # an update check must never take the tray down
+        if not (info.get("checked") and info.get("update")):
+            return
+
+        self.update_info = info
+        self.last_note = f"update {info.get('latest', '')} available"
+        self._refresh()
+        try:
+            self.icon.notify(
+                f"Version {info.get('latest', '')} is available. "
+                f"Open OpenMAD to install it.", "OpenMAD update")
+        except Exception:
+            pass  # balloon notifications are not available on every desktop
 
     def _active_profile_has_keymap(self) -> bool:
         """Whether the active profile stores key bindings of its own.
@@ -396,7 +439,13 @@ class TrayApp:
             # even bound, which is where the five to ten second wait came from.
             # Everything needed is already loaded here.
             try:
+                from mad68 import hud as _hud
                 from mad68.hud import serve
+                # Installing an update has to close this process before the
+                # installer can replace OpenMAD.exe. Quitting properly, rather
+                # than the module's hard-exit fallback, stops the switcher and
+                # releases the keyboard first.
+                _hud.EXIT_HOOK = self._quit
                 httpd, sampler = serve(PROFILE_DIR, port=HUD_PORT)
             except Exception as exc:
                 self.state = "error"
@@ -528,6 +577,8 @@ class TrayApp:
         print("tray icon visible; watching foreground window")
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
+        threading.Thread(target=self._check_for_update, daemon=True,
+                         name="update-check").start()
 
     def run(self) -> None:
         self.icon.run(setup=self._setup)

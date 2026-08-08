@@ -36,6 +36,14 @@ WizardStyle=modern
 PrivilegesRequired=lowest
 DisableProgramGroupPage=yes
 UninstallDisplayIcon={app}\{#AppExe}
+; In-app updating runs this installer with /SILENT while OpenMAD is still
+; shutting down. Windows will not overwrite a running executable, so let the
+; Restart Manager close any instance still holding it rather than failing the
+; file copy -- with /SUPPRESSMSGBOXES there would be no prompt to answer.
+; RestartApplications is off because the [Run] entry below does the relaunch,
+; and both would start a second copy.
+CloseApplications=yes
+RestartApplications=no
 
 [Files]
 Source: "..\dist\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
@@ -74,3 +82,8 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "Start {#AppName}"; Flags: nowait postinstall skipifsilent
+; The interactive entry above is a tick-box on the final wizard page, which a
+; silent run never shows -- that is what `skipifsilent` means. An in-app update
+; is exactly a silent run, so without this line the app would close to install
+; and never come back. WizardSilent covers /SILENT and /VERYSILENT alike.
+Filename: "{app}\{#AppExe}"; Flags: nowait; Check: WizardSilent
