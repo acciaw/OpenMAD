@@ -199,8 +199,16 @@ class TrayApp:
         try:
             on_disk = (SwitcherConfig.load(CONFIG_PATH) if CONFIG_PATH.exists()
                        else SwitcherConfig())
-        except Exception:
-            on_disk = self.config
+        except Exception as exc:
+            # The file is there but will not parse. self.config is whatever
+            # _load_config fell back to, which is the defaults -- writing it
+            # here would replace the user's only copy of their rules with an
+            # empty one, the exact thing _load_config refuses to do. Toggling
+            # auto-switch was enough to trigger it. Keep the file instead; the
+            # one setting this method owns is not worth losing the rest for.
+            print(f"config unreadable ({exc}); leaving it untouched rather than "
+                  f"overwriting it with defaults", file=sys.stderr)
+            return
         on_disk.enabled = self.config.enabled
         try:
             on_disk.save(CONFIG_PATH)

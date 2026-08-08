@@ -246,10 +246,23 @@ class SwitcherConfig:
 
     @classmethod
     def from_json(cls, d: dict) -> "SwitcherConfig":
+        # Older files load; only a file from a *newer* app is refused.
+        #
+        # This used to demand an exact match, which made every future version
+        # bump silently discard the settings of everyone upgrading: the file
+        # became unreadable, the tray fell back to defaults, and the user's
+        # rules were gone. Every field below already has a default, so a v1
+        # file read by a v2 app simply leaves the new fields unset -- the same
+        # forward compatibility Profile.from_json has always had.
+        #
+        # A config written by a newer version is the one case worth refusing,
+        # since it may mean something by a field this code would misread. The
+        # caller keeps the file rather than overwriting it.
         version = d.get("config_version")
-        if version != CONFIG_VERSION:
+        if not isinstance(version, int) or version > CONFIG_VERSION:
             raise ValueError(
-                f"unsupported config_version {version!r}, expected {CONFIG_VERSION}"
+                f"unsupported config_version {version!r}, expected {CONFIG_VERSION} "
+                f"or older"
             )
         return cls(
             default_profile=d.get("default_profile", "") or "",
