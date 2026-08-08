@@ -27,12 +27,21 @@ _DEFAULTS = {
 def _locate() -> Path | None:
     candidates = []
     if getattr(sys, "frozen", False):
-        # PyInstaller unpacks bundled data to _MEIPASS, and the exe's own
-        # directory is checked too so the file can be edited beside a build.
+        # The copy beside the executable comes first, and the bundled one is
+        # the fallback.
+        #
+        # Both exist in an installed build: the installer writes version.ini
+        # into {app}, and PyInstaller bakes another into the bundle at build
+        # time. They disagree whenever the version is bumped after the exe was
+        # built -- and with _MEIPASS checked first, the stale bundled copy won,
+        # so a 1.0.1 install kept reporting 1.0.0 and kept offering itself as an
+        # update. The installer's copy is the one that tracks the release being
+        # installed, and putting it first is also what makes the file editable
+        # beside a build, which this has always claimed to support.
+        candidates.append(Path(sys.executable).parent / "version.ini")
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:
             candidates.append(Path(meipass) / "version.ini")
-        candidates.append(Path(sys.executable).parent / "version.ini")
     candidates.append(Path(__file__).resolve().parent.parent.parent / "version.ini")
     for path in candidates:
         if path.exists():
