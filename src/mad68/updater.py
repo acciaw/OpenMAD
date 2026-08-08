@@ -222,10 +222,26 @@ class Updater:
             self.state = "installing"
 
         log = _download_dir() / "install.log"
+
+        # The installer has to start *after* this process is gone, not
+        # alongside it.
+        #
+        # Inno reaches its in-use check about two tenths of a second after
+        # launch, while this process does not exit until the caller's shutdown
+        # completes. Launching it directly meant the running executable was
+        # always still holding OpenMAD.exe when Inno looked, and the install
+        # was abandoned and rolled back before the app had even begun to close.
+        #
+        # So the launch is handed to a detached `cmd` that sleeps first. `ping`
+        # rather than `timeout`, because `timeout` needs a console and this
+        # deliberately has none. The delay is the ordinary path; `force` in the
+        # .iss is the safety net for a shutdown that takes longer than this.
+        delay_s = 5
+        cmd = (f'ping -n {delay_s + 1} 127.0.0.1 >nul & '
+               f'"{installer}" /SILENT /SUPPRESSMSGBOXES /NORESTART /LOG="{log}"')
         try:
             subprocess.Popen(
-                [str(installer), "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
-                 f"/LOG={log}"],
+                ["cmd", "/c", cmd],
                 creationflags=(subprocess.DETACHED_PROCESS
                                | subprocess.CREATE_NEW_PROCESS_GROUP),
                 close_fds=True,
