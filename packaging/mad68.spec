@@ -26,10 +26,13 @@ a = Analysis(
     [str(REPO / "tools" / "tray.py")],
     pathex=[str(REPO / "src")],
     binaries=[],
-    # The profiles that ship as a starting point. User profiles are written to
-    # the writable data directory at runtime, not here.
+    # Deliberately no profiles/ and no switcher.json. The repository root is the
+    # working data directory during development, so those files are whoever's
+    # machine built the release -- bundling them shipped the developer's own
+    # profiles and app rules to every user. A fresh install creates a plain
+    # "Default" profile by itself (profile.ensure_default_profile), and
+    # mad68.paths keeps user data in %APPDATA% from then on.
     datas=[
-        (str(REPO / "profiles"), "profiles"),
         # Identity is read from this at runtime, so it has to travel
         # with the executable.
         (str(REPO / "version.ini"), "."),

@@ -22,11 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from mad68.hud import serve  # noqa: E402
-
-if getattr(sys, "_MEIPASS", None):
-    REPO = Path(sys._MEIPASS)
-else:
-    REPO = Path(__file__).resolve().parent.parent
+from mad68.paths import seed_user_data  # noqa: E402
 
 
 def main() -> int:
@@ -39,7 +35,7 @@ def main() -> int:
     ap.add_argument("--no-browser", action="store_true")
     args = ap.parse_args()
 
-    httpd, sampler = serve(REPO / "profiles", port=args.port, interval=args.interval)
+    httpd, sampler = serve(seed_user_data(), port=args.port, interval=args.interval)
     url = f"http://127.0.0.1:{args.port}/"
     print(f"HUD serving at {url}")
     print("press keys on the keyboard to see them light up; Ctrl-C to stop")

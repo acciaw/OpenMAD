@@ -14,7 +14,6 @@ import json
 import os
 import queue
 import re
-import subprocess
 import sys
 import threading
 import time
@@ -28,6 +27,7 @@ from .device import Mad68, RapidTrigger, find_config_interface, in_bootloader
 from .features import AdvancedKey, BoxLight, DeadBand, Dks, DksAction
 from .features import KeyboardFeature, LightInfo, MacroStep
 from .keycodes import label
+from .paths import assets_dir
 from .profile import (
     PER_KEY_EFFECT,
     Profile,
@@ -430,60 +430,118 @@ def read_full_config(kb: Mad68) -> dict:
     }
 
 
+# Native Win32 file dialogs, straight from comdlg32.
+#
+# These used to run Tk inside a subprocess spawned from sys.executable. That
+# works from a source checkout and cannot work from a build: PyInstaller sets
+# sys.executable to OpenMAD.exe, not to a Python interpreter, so "Browse for
+# .exe" launched a second copy of the app, got no path back on stdout and
+# returned None -- the picker never appeared at all. ctypes calls the same
+# dialog Explorer uses, needs neither an interpreter nor Tk, and behaves
+# identically frozen and unfrozen.
+
+_OFN_OVERWRITEPROMPT = 0x00000002
+_OFN_HIDEREADONLY = 0x00000004
+_OFN_NOCHANGEDIR = 0x00000008
+_OFN_PATHMUSTEXIST = 0x00000800
+_OFN_FILEMUSTEXIST = 0x00001000
+_OFN_EXPLORER = 0x00080000
+
+
+def _ofn_filter(pairs: list[tuple[str, str]]) -> str:
+    """comdlg32 wants label/pattern pairs NUL-separated and NUL-NUL-terminated."""
+    return "".join(f"{label}\0{pattern}\0" for label, pattern in pairs) + "\0"
+
+
+def _file_dialog(title: str, filters: list[tuple[str, str]], *, save: bool = False,
+                 default_name: str = "", default_ext: str = "") -> str | None:
+    """Show an open or save dialog and return the chosen path, or None."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class OPENFILENAMEW(ctypes.Structure):
+        _fields_ = [
+            ("lStructSize", wintypes.DWORD),
+            ("hwndOwner", wintypes.HWND),
+            ("hInstance", wintypes.HINSTANCE),
+            ("lpstrFilter", wintypes.LPCWSTR),
+            ("lpstrCustomFilter", wintypes.LPWSTR),
+            ("nMaxCustFilter", wintypes.DWORD),
+            ("nFilterIndex", wintypes.DWORD),
+            ("lpstrFile", wintypes.LPWSTR),
+            ("nMaxFile", wintypes.DWORD),
+            ("lpstrFileTitle", wintypes.LPWSTR),
+            ("nMaxFileTitle", wintypes.DWORD),
+            ("lpstrInitialDir", wintypes.LPCWSTR),
+            ("lpstrTitle", wintypes.LPCWSTR),
+            ("Flags", wintypes.DWORD),
+            ("nFileOffset", wintypes.WORD),
+            ("nFileExtension", wintypes.WORD),
+            ("lpstrDefExt", wintypes.LPCWSTR),
+            ("lCustData", wintypes.LPARAM),
+            ("lpfnHook", ctypes.c_void_p),
+            ("lpTemplateName", wintypes.LPCWSTR),
+            ("pvReserved", ctypes.c_void_p),
+            ("dwReserved", wintypes.DWORD),
+            ("FlagsEx", wintypes.DWORD),
+        ]
+
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        comdlg32 = ctypes.WinDLL("comdlg32", use_last_error=True)
+        # restype matters on 64-bit: the default c_int truncates the HWND.
+        user32.GetForegroundWindow.argtypes = []
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        fn = comdlg32.GetSaveFileNameW if save else comdlg32.GetOpenFileNameW
+        fn.argtypes = [ctypes.POINTER(OPENFILENAMEW)]
+        fn.restype = wintypes.BOOL
+
+        buf = ctypes.create_unicode_buffer(default_name, 32768)
+        ofn = OPENFILENAMEW()
+        ofn.lStructSize = ctypes.sizeof(OPENFILENAMEW)
+        # Owned by whatever is in front -- normally the browser the HUD is open
+        # in -- so the dialog comes up over it instead of only blinking in the
+        # taskbar. This process is not the foreground one when the click
+        # arrives, so an unowned dialog would not reliably raise itself.
+        ofn.hwndOwner = user32.GetForegroundWindow()
+        ofn.lpstrFilter = _ofn_filter(filters)
+        ofn.lpstrFile = ctypes.cast(buf, wintypes.LPWSTR)
+        ofn.nMaxFile = 32768
+        ofn.lpstrTitle = title
+        ofn.lpstrDefExt = default_ext or None
+        # NOCHANGEDIR because the dialog otherwise moves the whole process's
+        # working directory to wherever the user browsed.
+        ofn.Flags = (_OFN_EXPLORER | _OFN_HIDEREADONLY | _OFN_NOCHANGEDIR
+                     | _OFN_PATHMUSTEXIST
+                     | (_OFN_OVERWRITEPROMPT if save else _OFN_FILEMUSTEXIST))
+        # Cancelling returns 0 and is not an error, so the result is simply the
+        # absence of a path.
+        if not fn(ctypes.byref(ofn)):
+            return None
+        return buf.value or None
+    except Exception:
+        return None
+
+
 def browse_for_exe() -> str | None:
-    """Open a native file picker for an executable.
-
-    Runs in a short-lived subprocess: Tk insists on owning a thread's event loop,
-    and the HTTP server is already threaded, so spawning keeps the two apart.
-    """
-    code = (
-        "import tkinter as tk;from tkinter import filedialog;"
-        "r=tk.Tk();r.withdraw();r.attributes('-topmost',True);"
-        "p=filedialog.askopenfilename(title='Pick the game or app executable',"
-        "filetypes=[('Executables','*.exe'),('All files','*.*')]);"
-        "print(p or '')"
+    """Open a native file picker for an executable."""
+    return _file_dialog(
+        "Pick the game or app executable",
+        [("Executables", "*.exe"), ("All files", "*.*")],
     )
-    try:
-        out = subprocess.run([sys.executable, "-c", code], capture_output=True,
-                             text=True, timeout=180)
-        path = (out.stdout or "").strip()
-        return path or None
-    except Exception:
-        return None
-
-
-def _file_dialog(code: str) -> str | None:
-    """Run a Tk file dialog in a subprocess and return the chosen path.
-
-    Same reasoning as browse_for_exe: Tk wants to own a thread's event loop
-    and the HTTP server is already threaded, so the dialog gets its own process.
-    """
-    wrapper = (
-        "import tkinter as tk;from tkinter import filedialog;"
-        "r=tk.Tk();r.withdraw();r.attributes('-topmost',True);"
-        + code + ";print(p or '')"
-    )
-    try:
-        out = subprocess.run([sys.executable, "-c", wrapper], capture_output=True,
-                             text=True, timeout=300)
-        return (out.stdout or "").strip() or None
-    except Exception:
-        return None
 
 
 def browse_open_json(title: str) -> str | None:
     return _file_dialog(
-        f"p=filedialog.askopenfilename(title={title!r},"
-        "filetypes=[('Profile files','*.json'),('All files','*.*')])"
-    )
+        title, [("Profile files", "*.json"), ("All files", "*.*")])
 
 
 def browse_save_json(title: str, default_name: str) -> str | None:
     return _file_dialog(
-        f"p=filedialog.asksaveasfilename(title={title!r},"
-        f"initialfile={default_name!r},defaultextension='.json',"
-        "filetypes=[('Profile files','*.json')])"
-    )
+        title, [("Profile files", "*.json")],
+        save=True, default_name=default_name, default_ext="json")
 
 
 # GITHUB_REPO and APP_VERSION come from version.ini via .version, which the
@@ -782,7 +840,9 @@ def make_handler(sampler: Sampler):
             elif path in ("/logo.png", "/icon.png", "/icon.ico"):
                 # Branding is dropped into assets/ rather than embedded. A
                 # missing file is a 404 the page handles, not an error.
-                asset = Path(sampler.profile_dir).parent / "assets" / path.lstrip("/")
+                # Read from the bundle, not from the data directory: this ships
+                # with the app, so it does not sit beside the user's profiles.
+                asset = assets_dir() / path.lstrip("/")
                 if asset.exists():
                     kind = ("image/png" if path.endswith(".png")
                             else "image/x-icon")
@@ -2143,7 +2203,10 @@ PAGE_HUD = r"""<!doctype html>
 <link rel="icon" href="/icon.ico">
 <style>""" + CSS + r"""
 /* ---- app shell -------------------------------------------------------- */
-.app { display: grid; grid-template-columns: 240px 1fr; min-height: 100vh; }
+/* 268px, not 240: a profile that is both the fallback and the one saved to the
+   keyboard carries two badges, and at 240 the pair left the name about 26px to
+   render in, which hid it almost completely. */
+.app { display: grid; grid-template-columns: 268px 1fr; min-height: 100vh; }
 .sidebar {
   background: rgba(12,12,14,0.72); backdrop-filter: blur(14px);
   border-right: 1px solid var(--panel-brd); padding: 20px 16px 16px;
@@ -2201,19 +2264,24 @@ PAGE_HUD = r"""<!doctype html>
 .prow {
   text-align: left; border: 1px solid transparent; background: transparent;
   border-radius: var(--radius); padding: 7px 6px 7px 12px; color: var(--ink-2);
-  cursor: pointer; display: flex; align-items: center; gap: var(--s2);
+  cursor: pointer; display: flex; align-items: center; gap: 6px;
 }
 .prow:hover { background: rgba(255,255,255,0.05); color: var(--ink); }
 /* The selected profile carries an accent rail, so which one is open is legible
    at a glance rather than from a faint background wash. */
 .prow.on { background: rgba(255,255,255,0.07); color: #fff;
            box-shadow: inset 2px 0 0 var(--accent); }
-.pname { flex: 1 1 auto; min-width: 0; overflow: hidden;
+/* A floor, so the name is always legible. Without one the badges won every
+   fight for space and the name was ellipsised down to nothing. */
+.pname { flex: 1 1 auto; min-width: 5em; overflow: hidden;
          text-overflow: ellipsis; white-space: nowrap; }
-.plist .badge { flex: none; font-size: 10px; font-weight: 600;
-                letter-spacing: .04em; text-transform: uppercase;
+/* Shrinkable, unlike the name: if a row genuinely runs out of room the badge
+   gives way first, since it is the shorter and more guessable of the two. */
+.plist .badge { flex: 0 1 auto; min-width: 0; overflow: hidden;
+                font-size: 9px; font-weight: 600; white-space: nowrap;
+                text-transform: uppercase;
                 color: var(--accent-hi); background: var(--accent-dim);
-                border-radius: 5px; padding: 2px 6px; }
+                border-radius: 5px; padding: 2px 5px; }
 .prow.on .badge { color: #fff; }
 /* Visible on hover and on the open profile, so the row stays quiet otherwise
    but the affordance is always reachable where you are looking. */
@@ -2530,7 +2598,10 @@ function showAkPicks(){
    them here would imply they are part of the profile. They are reached from
    the sidebar instead. */
 const TABS=["Change Key Setting","Lighting Setting","Performance","Advanced Key",
-            "App Trigger","Other Setting"];
+            "App Trigger","Other Settings"];
+/* The vendor's own configurator, which is where firmware flashing lives. The
+   sidebar's Firmware link points at the same place from static markup. */
+const FIRMWARE_URL="https://hub.fgg.com.cn/";
 /* Which sidebar section is showing: the profile editor, or the shared
    device-wide macro editor. */
 let view="equipment";
@@ -2668,6 +2739,22 @@ const BRIGHT_MAX=210;
    like, so never send it. Profiles written before this control existed all
    carry speed 0 and fall back to this. */
 const DEFAULT_SPEED=128;
+/* A profile that has never had a colour picked carries r=g=b=0, and black is
+   not something the LEDs can show. For the effects that take a colour -- the
+   two Rainbow static modes among them -- sending black collapses the whole
+   pattern to one dead hue, which is why a rainbow stopped looking like a
+   rainbow until a colour had been set once. Nothing in the packet distinguishes
+   "never set" from "deliberately black", and deliberate black is
+   indistinguishable from off anyway, so all-zero is read as unset and given a
+   colour the board can actually render. */
+const DEFAULT_RGB=[255,255,255];
+function liRGB(li){
+  const r=+(li.r||0), g=+(li.g||0), b=+(li.b||0);
+  return (r||g||b)?[r,g,b]:DEFAULT_RGB.slice();
+}
+function liHex(li){
+  return "#"+liRGB(li).map(v=>Number(v).toString(16).padStart(2,"0")).join("");
+}
 const SWATCHES=["#e91e8c","#ef4d92","#f4695f","#f57c1f","#f0a51e","#f5d020",
  "#a8d030","#22a04a","#2f7fe0","#7c4dd0"];
 
@@ -2949,7 +3036,9 @@ function drawSidebar(){
   if(mc)mc.className="navbtn"+(view==="macros"?" on":"");
   const html=profiles.map(p=>`<div class="prow${p.name===editing?" on":""}"
     data-p="${p.name}"><span class="pname">${p.name}</span>
-    ${p.name===ob.profile?'<span class="badge">on board</span>':''}
+    ${p.name===ob.profile
+      ? '<span class="badge" title="Saved into the onboard memory on the keyboard">board</span>'
+      : ''}
     ${p.name===defaultProfile
       ? '<span class="badge" title="Used when no app rule matches">default</span>'
       : ''}
@@ -3121,7 +3210,8 @@ function pageHTML(){
 
   case "Lighting Setting": {
     const li=editDoc.light||{};
-    const hex="#"+[li.r||0,li.g||0,li.b||0].map(v=>Number(v).toString(16).padStart(2,"0")).join("");
+    const [cr,cg,cb]=liRGB(li);
+    const hex=liHex(li);
     const bright=Math.round((Number(li.brightness||0)/BRIGHT_MAX)*100);
     const cur=EFFECT_BY_N[li.effect||0];
     const useCol=cur?cur[2]:1, useSpd=cur?cur[3]:0;
@@ -3186,11 +3276,11 @@ function pageHTML(){
                 <input type="text" id="li-hex" value="${hex}" style="width:100%">
                 <div class="row" style="margin-top:10px">
                   <label class="f">R <input type="number" id="li-r" min="0" max="255"
-                    value="${li.r||0}" style="width:64px"></label>
+                    value="${cr}" style="width:64px"></label>
                   <label class="f">G <input type="number" id="li-g" min="0" max="255"
-                    value="${li.g||0}" style="width:64px"></label>
+                    value="${cg}" style="width:64px"></label>
                   <label class="f">B <input type="number" id="li-b" min="0" max="255"
-                    value="${li.b||0}" style="width:64px"></label></div>
+                    value="${cb}" style="width:64px"></label></div>
                 <input type="color" id="li-color" value="${hex}"
                   style="width:100%; height:120px; margin-top:12px"
                   ${useCol?"":"disabled"}>
@@ -3465,14 +3555,16 @@ function pageHTML(){
       </div></div>`;
   }
 
-  case "Other Setting": {
+  case "Other Settings": {
     const dev=(latest&&latest.device)||{};
     return `<div class="center">${boardHTML("keys")}</div>
       <div class="panel" style="max-width:760px;margin:22px auto 0">
         <div class="row" style="padding:14px 0;border-bottom:1px solid var(--panel-brd)">
           <div><b>Keyboard protocol version ${config.protocol_version}</b>
-            <div class="sub">Firmware flashing is not implemented in this driver.</div></div>
-          <button class="spacer" disabled title="not implemented">Manually brush in firmware</button></div>
+            <div class="sub">Flashing is not implemented here. The official
+              configurator does it.</div></div>
+          <button class="spacer" id="fw-open"
+            title="Opens the official configurator in a new tab">Update firmware &#8599;</button></div>
         <div class="row" style="padding:14px 0;border-bottom:1px solid var(--panel-brd)">
           <div>The key bindings will be restored to the factory state.
             <div class="sub">Resets the dynamic keymap only.</div></div>
@@ -3481,9 +3573,6 @@ function pageHTML(){
           <div>Export <b>${editing}</b>
             <div class="sub">Saves this one profile to a file you can share.</div></div>
           <button class="spacer" id="prof-export">Export profile…</button></div>
-        <div class="row" style="padding:14px 0;border-bottom:1px solid var(--panel-brd)">
-          <div>Set preview image appearance</div>
-          <select class="spacer" id="skin"><option>Black</option><option>White</option></select></div>
         <div class="row" style="padding:14px 0">
           <div>Restore factory settings
             <div class="sub">Wipes the keyboard's onboard settings. A snapshot is
@@ -3837,7 +3926,9 @@ function wirePage(root){
       // Carry whatever the sliders currently show, not the stored values, so
       // switching effect never silently resets brightness, speed or colour.
       const li=editDoc.light||{};
-      const [r,g,b2]=hex2rgb(val("li-hex")||"#000000");
+      // Never fall back to black here: picking a colour-driven effect would
+      // then write black over the profile and kill the effect it just enabled.
+      const [r,g,b2]=hex2rgb(val("li-hex")||liHex(li));
       await patchProfile({light:{...li,effect:+b.dataset.eff,
         brightness:+val("li-bright"),speed:liSpeed(),r,g,b:b2}});
       toast(`effect ${b.dataset.eff} applied`);draw();});
@@ -4182,7 +4273,8 @@ function wirePage(root){
     }
   }
 
-  if(tab==="Other Setting"){
+  if(tab==="Other Settings"){
+    on("fw-open",()=>{window.open(FIRMWARE_URL,"_blank","noopener");});
     on("prof-export",async()=>{
       const r=await post("/api/profile/export",{name:editing});
       toast(r.saved?`exported ${editing}`:"export cancelled");});

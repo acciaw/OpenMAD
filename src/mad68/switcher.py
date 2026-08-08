@@ -207,7 +207,12 @@ class Rule:
 class SwitcherConfig:
     """Rules plus timing knobs."""
 
-    default_profile: str = "stock"
+    # Empty, not the name of a profile. A fresh install has no fallback until
+    # the user picks one, and resolve() reads "" as "leave the keyboard alone".
+    # This used to default to "stock", which no build has ever shipped, so a
+    # first run failed to apply it, reported "profile 'stock' not found" and
+    # left the tray icon showing the red error state.
+    default_profile: str = ""
     rules: list[Rule] = field(default_factory=list)
     poll_interval_ms: int = 400
     debounce_ms: int = 800
