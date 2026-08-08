@@ -1,4 +1,4 @@
-"""Application-aware profile switching for the MAD68 HE.
+"""Application-aware profile switching for Madlions HE keyboards.
 
 Watches the Windows foreground window and applies the profile whose rule matches
 the active process. This is the capability the stock configurator does not have.

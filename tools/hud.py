@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serve the MAD68 HE live telemetry HUD on localhost.
+"""Serve the live telemetry HUD on localhost.
 
     python tools/hud.py                  # serve and open a browser
     python tools/hud.py --port 9000

@@ -26,6 +26,7 @@ from . import protocol as proto
 from .device import Mad68, RapidTrigger, find_config_interface, in_bootloader
 from .features import AdvancedKey, BoxLight, DeadBand, Dks, DksAction
 from .features import KeyboardFeature, LightInfo, MacroStep
+from . import devices
 from .keycodes import label
 from .paths import assets_dir
 from .updater import UPDATER, frozen_install_supported, pick_installer_asset
@@ -409,15 +410,42 @@ def read_full_config(kb: Mad68) -> dict:
         macros = [{"error": str(exc)}]
 
     proto_version = safe(kb.protocol_version, 0)
+    spec = kb.spec
+
+    # Read once into locals so the capability map can tell "the board answered"
+    # from "the board returned nothing", rather than calling each twice.
+    config_colors = [list(c) for c in safe(kb.read_all_key_colors, [])]
+    config_light = safe(lambda: kb.read_light_info().to_json())
+    config_box = safe(lambda: kb.read_box_light().to_json())
+    config_dead = safe(lambda: kb.read_dead_band().to_json())
+    config_feature = safe(lambda: kb.read_feature().to_json())
+
+    # What this particular board actually answered.
+    #
+    # Every section above is already wrapped in safe()/try, so a board that does
+    # not implement something returns a default rather than failing the whole
+    # read. Recording which ones came back real is what lets the UI hide panels
+    # a board cannot drive, instead of showing dead controls -- which is the
+    # difference between "degrades gracefully" and "looks broken".
+    caps = {
+        "light": config_light is not None,
+        "box_light": config_box is not None,
+        "dead_band": config_dead is not None,
+        "feature": config_feature is not None,
+        "advanced_keys": bool(advanced) or advanced == [],
+        "dks": bool(dks) or dks == [],
+        "macros": not (macros and isinstance(macros[0], dict) and "error" in macros[0]),
+        "key_colors": bool(config_colors),
+    }
 
     return {
         "actuation": kb.read_actuation_bulk(),
         "rapid_trigger": [rt.to_json() for rt in kb.read_rapid_trigger_bulk()],
-        "key_colors": [list(c) for c in safe(kb.read_all_key_colors, [])],
-        "light": safe(lambda: kb.read_light_info().to_json()),
-        "box_light": safe(lambda: kb.read_box_light().to_json()),
-        "dead_band": safe(lambda: kb.read_dead_band().to_json()),
-        "feature": safe(lambda: kb.read_feature().to_json()),
+        "key_colors": config_colors,
+        "light": config_light,
+        "box_light": config_box,
+        "dead_band": config_dead,
+        "feature": config_feature,
         "game_mode": safe(kb.read_game_mode, 0),
         "bottom_optimize": safe(kb.read_bottom_optimize, 0),
         "layers": layers,
@@ -428,6 +456,21 @@ def read_full_config(kb: Mad68) -> dict:
         "protocol_version_known": proto_version == proto.KNOWN_PROTOCOL_VERSION,
         "macro_count": safe(kb.macro_count, 0),
         "macro_buffer_size": safe(kb.macro_buffer_size, 0),
+        # Which board, and how much of it we can trust.
+        "board": spec.name,
+        "product_id": f"{spec.product_id:#06x}",
+        "rows": spec.rows,
+        "cols": spec.cols,
+        "matrix_layers": spec.layers,
+        "total_keys": spec.total_keys,
+        "form_factor": spec.form_factor,
+        "board_verified": spec.verified,
+        # Mirrors the gate in Mad68._check exactly: confirmed firmware AND a
+        # confirmed model, unless the user has unlocked this board by hand.
+        "writes_allowed": bool(
+            (kb.firmware_verified and spec.verified) or kb._allow_unverified),
+        "board_unlocked": devices.is_unlocked(spec.product_id),
+        "capabilities": caps,
     }
 
 
@@ -593,6 +636,180 @@ def check_for_update(timeout: float = 6.0) -> dict:
             "This release has no installer attached, so it has to be "
             "downloaded from the releases page."),
     }
+
+
+def _write_probe(kb: Mad68) -> dict:
+    """Prove that writes land where this driver thinks they do.
+
+    A read-only report can confirm the packet layouts are being *parsed*
+    correctly, but it cannot confirm anything about writing -- and writing is
+    the half that matters, because a wrong offset there corrupts a setting
+    rather than displaying a wrong number. So this writes one actuation value
+    to key 0, reads it back, and puts the original value straight back.
+
+    Two things keep it safe. FlashOp.NORMAL is the default on the bulk writers,
+    so this costs no flash endurance at all -- the value is volatile and would
+    not survive a power cycle even if the restore failed. And the restore is in
+    a finally block, so the original comes back even if the read-back raises.
+
+    Opt-in only: the plain report never mutates anything.
+    """
+    result: dict = {"ran": True}
+    original = None
+    try:
+        original = kb.read_actuation_bulk(0, 1)[0]
+        # Somewhere else in the legal range, so a read-back that simply echoes
+        # the old value cannot be mistaken for success.
+        target = 1.50 if abs(original - 1.50) > 0.10 else 2.20
+        kb.write_actuation_bulk([target], 0)
+        readback = kb.read_actuation_bulk(0, 1)[0]
+        # The firmware quantises travel, so compare with the same tolerance the
+        # profile diffing uses rather than demanding equality.
+        result.update({
+            "original_mm": round(original, 3),
+            "wrote_mm": round(target, 3),
+            "read_back_mm": round(readback, 3),
+            "match": abs(readback - target) <= 0.05,
+        })
+    except Exception as exc:
+        result.update({"error": str(exc), "match": False})
+    finally:
+        if original is not None:
+            try:
+                kb.write_actuation_bulk([original], 0)
+                result["restored_mm"] = round(kb.read_actuation_bulk(0, 1)[0], 3)
+                result["restored"] = abs(result["restored_mm"] - original) <= 0.05
+            except Exception as exc:
+                result["restored"] = False
+                result["restore_error"] = str(exc)
+    return result
+
+
+def build_diagnostic_report(kb: Mad68, write_probe: bool = False) -> dict:
+    """Everything needed to add support for a board nobody here owns.
+
+    This is the whole point of the read-only-until-verified rule: an owner of an
+    untested board can produce the evidence without anyone having to guess at
+    write layouts. It is a read-only sweep -- nothing here mutates the keyboard.
+
+    Deliberately excluded: the serial number, and anything from the user's
+    profiles or app rules. The serial identifies a specific physical unit and
+    nothing about it helps decode a protocol, so it never leaves the machine.
+    """
+    spec = kb.spec
+
+    def safe(fn, default=None):
+        try:
+            return fn()
+        except Exception as exc:
+            return {"error": str(exc)} if default is None else default
+
+    # Which vendor sub-commands answer with real data, and which come back as
+    # the 0xFF "unhandled" echo. This is the map that says what a board can do.
+    probes: dict[str, dict] = {}
+    try:
+        for name, raw in kb.iter_probe_reads():
+            probes[name] = {"ok": True, "hex": raw.hex()}
+    except Exception as exc:
+        probes["__sweep_error__"] = {"ok": False, "error": str(exc)}
+
+    return {
+        "report_version": 1,
+        "app_version": APP_VERSION,
+        "generated_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "driver_known_protocol": proto.KNOWN_PROTOCOL_VERSION,
+        "device": {
+            "vendor_id": f"{VENDOR_ID:#06x}",
+            "product_id": f"{spec.product_id:#06x}",
+            "registry_name": spec.name,
+            "in_registry": devices.lookup(spec.product_id) is not None,
+            "verified": spec.verified,
+            "rows": spec.rows,
+            "cols": spec.cols,
+            "layers": spec.layers,
+            "product_string": kb.info.get("product_string"),
+            "manufacturer_string": kb.info.get("manufacturer_string"),
+            "release_number": kb.info.get("release_number"),
+            "interface_number": kb.info.get("interface_number"),
+            "usage_page": kb.info.get("usage_page"),
+            "usage": kb.info.get("usage"),
+        },
+        "firmware": {
+            "protocol_version": safe(kb.protocol_version, 0),
+            "layer_count": safe(kb.layer_count, 0),
+            "macro_count": safe(kb.macro_count, 0),
+            "macro_buffer_size": safe(kb.macro_buffer_size, 0),
+        },
+        # Read back so a wrong assumption about matrix size shows up immediately
+        # as a short or over-long array.
+        "geometry_readback": {
+            "actuation_len": len(safe(kb.read_actuation_bulk, [])),
+            "rapid_trigger_len": len(safe(kb.read_rapid_trigger_bulk, [])),
+            "key_colors_len": len(safe(kb.read_all_key_colors, [])),
+            "populated_mask": safe(lambda: "".join(
+                "1" if b else "0" for b in kb.populated_mask()), ""),
+        },
+        "probes": probes,
+        # Absent unless the user asked for it, and its absence is itself
+        # meaningful when reading a report: no write path was exercised.
+        "write_probe": _write_probe(kb) if write_probe else {"ran": False},
+    }
+
+
+def _probe_summary(wp: dict) -> str:
+    """One line for the issue title area. Absence is a meaningful answer here."""
+    if not wp.get("ran"):
+        return "not run (read-only report)"
+    if wp.get("error"):
+        return f"FAILED - {wp['error']}"
+    if wp.get("match"):
+        return (f"PASSED - wrote {wp.get('wrote_mm')} mm, read back "
+                f"{wp.get('read_back_mm')} mm")
+    return (f"MISMATCH - wrote {wp.get('wrote_mm')} mm, read back "
+            f"{wp.get('read_back_mm')} mm")
+
+
+def _connected_pid() -> int:
+    """Product ID of whatever is plugged in, or 0."""
+    try:
+        return int(find_config_interface().get("product_id") or 0)
+    except Exception:
+        return 0
+
+
+def _diagnostic_issue_url(report: dict) -> str:
+    """A prefilled GitHub issue for a board report.
+
+    A URL rather than an upload endpoint: it needs no server, the user sees the
+    whole body before anything is sent, and the submission lands somewhere
+    public and trackable instead of in a private inbox. GitHub truncates very
+    long query strings, so only the summary is inlined and the full JSON is
+    attached as a file by the user.
+    """
+    dev = report.get("device") or {}
+    fw = report.get("firmware") or {}
+    geo = report.get("geometry_readback") or {}
+    name = dev.get("registry_name") or "unknown board"
+    title = f"Board report: {name} ({dev.get('product_id', '?')})"
+    body = (
+        f"Board: **{name}**\n"
+        f"VID:PID: `{dev.get('vendor_id')}:{dev.get('product_id')}`\n"
+        f"In registry: {dev.get('in_registry')}  ·  Verified: {dev.get('verified')}\n"
+        f"Matrix: {dev.get('rows')} x {dev.get('cols')}, {dev.get('layers')} layers\n"
+        f"Protocol version: **{fw.get('protocol_version')}** "
+        f"(driver built against {report.get('driver_known_protocol')})\n"
+        f"Readback lengths: actuation={geo.get('actuation_len')}, "
+        f"rt={geo.get('rapid_trigger_len')}, colours={geo.get('key_colors_len')}\n"
+        f"Write test: {_probe_summary(report.get('write_probe') or {})}\n"
+        f"OpenMAD {report.get('app_version')}\n\n"
+        f"---\n\n"
+        f"Please attach the JSON file the app just saved (drag it into this box).\n\n"
+        f"Anything odd on screen? Keys drawn in the wrong place, values that look "
+        f"wrong, panels that are empty:\n\n"
+    )
+    from urllib.parse import quote
+    return (f"https://github.com/{GITHUB_REPO}/issues/new"
+            f"?title={quote(title)}&body={quote(body)}&labels={quote('board report')}")
 
 
 def _default_exit() -> None:
@@ -799,13 +1016,30 @@ def build_stamp() -> dict:
 
 
 def device_identity() -> dict:
-    """Detect the keyboard without opening it for I/O."""
+    """Detect whichever board is connected, without opening it for I/O.
+
+    Reports what was actually found rather than what this driver was written
+    for: the config interface is a controller feature shared across the family,
+    so the product ID has to be read back and looked up rather than assumed.
+    """
     try:
         iface = find_config_interface()
+        pid = int(iface.get("product_id") or 0)
+        spec = devices.describe(pid)
         return {
             "present": True,
             "vendor_id": f"{VENDOR_ID:#06x}",
-            "product_id": f"{PRODUCT_ID:#06x}",
+            "product_id": f"{pid:#06x}",
+            # The registry's name, not the USB descriptor's -- several boards
+            # report a generic product string.
+            "board": spec.name,
+            "rows": spec.rows,
+            "cols": spec.cols,
+            "layers": spec.layers,
+            "total_keys": spec.total_keys,
+            "form_factor": spec.form_factor,
+            "known_board": devices.lookup(pid) is not None,
+            "verified_board": spec.verified,
             "product": iface.get("product_string"),
             "manufacturer": iface.get("manufacturer_string"),
             "serial": iface.get("serial_number"),
@@ -817,7 +1051,8 @@ def device_identity() -> dict:
             "bootloader": in_bootloader(),
             "reason": str(exc),
             "vendor_id": f"{VENDOR_ID:#06x}",
-            "product_id": f"{PRODUCT_ID:#06x}",
+            "board": None,
+            "supported_boards": len(devices.BOARDS),
         }
 
 
@@ -1457,6 +1692,49 @@ def make_handler(sampler: Sampler):
                     raise ValueError(why)
                 return UPDATER.start(asset, version=info.get("latest", ""))
 
+            if path == "/api/board/unlock":
+                # Deliberately awkward, like the factory reset: a typed
+                # confirmation, not a checkbox. Writing with packet offsets
+                # nobody has confirmed on this model is exactly the risk the
+                # gate exists for, so the user has to state it in words.
+                pid = int(d.get("product_id") or 0) or _connected_pid()
+                on = bool(d.get("enabled", True))
+                if on and d.get("confirm") != "I UNDERSTAND":
+                    raise ValueError("unlocking needs confirm == 'I UNDERSTAND'")
+                devices.unlock(pid, on)
+                devices.save_unlocked(Path(s.profile_dir).parent / "unlocked_boards.json")
+                return {"product_id": f"{pid:#06x}", "unlocked": devices.is_unlocked(pid)}
+
+            if path == "/api/diagnostic-report":
+                # Saved to a file rather than posted anywhere. The user sees
+                # exactly what is in it and chooses whether to attach it, which
+                # is the only honest way to collect data off someone's machine.
+                probe = bool(d.get("write_probe"))
+
+                def _run(kb):
+                    if not probe:
+                        return build_diagnostic_report(kb, write_probe=False)
+                    # The probe is the thing that proves writing works, so on an
+                    # unverified board it cannot run through the normal gated
+                    # handle -- that handle is blocked precisely because nobody
+                    # has proved it yet. It gets its own explicitly unverified
+                    # handle for one volatile, self-restoring write.
+                    from .device import Mad68 as _M
+                    report = build_diagnostic_report(kb, write_probe=False)
+                    with _M(writes=True, allow_unverified=True) as probe_kb:
+                        report["write_probe"] = _write_probe(probe_kb)
+                    return report
+
+                report = s.submit(_run, timeout=120)
+                stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+                pid = (report.get("device") or {}).get("product_id", "unknown")
+                dest = (Path(s.profile_dir).parent / "reports"
+                        / f"openmad-report-{pid}-{stamp}.json")
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(json.dumps(report, indent=2), encoding="utf-8")
+                return {"path": str(dest), "report": report,
+                        "issue_url": _diagnostic_issue_url(report)}
+
             if path == "/api/update/install":
                 # Shutting down is what lets the installer replace the running
                 # executable, so the reply is sent first and the app quits a
@@ -1645,6 +1923,9 @@ def _reconcile_rules(profile_dir: Path) -> int:
 
 def serve(profile_dir: Path, host: str = "127.0.0.1", port: int = 8787,
           interval: float = 0.03) -> tuple[ThreadingHTTPServer, Sampler]:
+    # Whoever owns the data directory tells devices.py which boards the user
+    # unlocked; the transport consults it without knowing where it came from.
+    devices.load_unlocked(Path(profile_dir).parent / "unlocked_boards.json")
     if ensure_default_profile(profile_dir):
         print(f"created the default profile in {profile_dir}")
     if _reconcile_rules(profile_dir):
@@ -2136,9 +2417,9 @@ dd { margin: 0; font-variant-numeric: tabular-nums; }
 
   <div class="hero">
     <h1>Your keyboard, on your machine.</h1>
-    <p class="tag">A local driver for the MAD68 HE. Everything the official
-      web tool does, plus named profiles and automatic switching when you
-      change game.</p>
+    <p class="tag">A local driver for Madlions Hall-effect keyboards. Everything
+      the official web tool does, plus named profiles and automatic switching
+      when you change game.</p>
   </div>
 
   <div class="panel devpanel">
@@ -2215,22 +2496,33 @@ async function check() {
     const d = await (await fetch("/api/device")).json();
     if (d.present) {
       led.className = "led on";
-      title.textContent = "MAD68 HE connected";
-      note.textContent = "Raw HID config interface found on usage page 0xff60.";
+      // Whatever board actually answered, not the one this was written for.
+      title.textContent = (d.board || "Keyboard") + " connected";
+      note.textContent = d.verified_board
+        ? "Raw HID config interface found on usage page 0xff60."
+        : (d.known_board
+            ? "Recognised, but not yet confirmed on this model — settings are "
+              + "read-only until it is. See Other Settings to help verify it."
+            : "This board is not in the supported list. It shares the vendor's "
+              + "config interface, so it opens read-only.");
+      const geo = d.rows && d.cols
+        ? `${d.rows} × ${d.cols} (${d.total_keys} keys)` : "-";
       info.innerHTML =
+        `<dt>Board</dt><dd>${d.board ?? "-"}</dd>` +
+        `<dt>Matrix</dt><dd>${geo}</dd>` +
         `<dt>Product</dt><dd>${d.product ?? "-"}</dd>` +
         `<dt>Manufacturer</dt><dd>${d.manufacturer ?? "-"}</dd>` +
-        `<dt>Serial</dt><dd>${d.serial ?? "-"}</dd>` +
         `<dt>VID:PID</dt><dd>${d.vendor_id}:${d.product_id}</dd>`;
       open.disabled = false;
     } else {
       led.className = "led off";
       title.textContent = d.bootloader ? "Keyboard is in bootloader mode"
-                                       : "No MAD68 HE detected";
+                                       : "No Madlions keyboard detected";
       note.textContent = d.bootloader
         ? "Unplug and replug it to return to normal operation."
         : (d.reason || "Connect the keyboard directly, not through a KVM.");
-      info.innerHTML = `<dt>Looking for</dt><dd>${d.vendor_id}:${d.product_id}</dd>`;
+      info.innerHTML =
+        `<dt>Looking for</dt><dd>${d.vendor_id} (${d.supported_boards ?? 0} boards)</dd>`;
       open.disabled = true;
     }
   } catch (e) {
@@ -2663,10 +2955,23 @@ const FIRMWARE_URL="https://hub.fgg.com.cn/";
    device-wide macro editor. */
 let view="equipment";
 
-/* physical 65% layout: [row, col, width-in-units]. Rows total 16u.
-   Enter absorbs the empty r2c12, LShift absorbs r3c1, Space absorbs
-   r4 c3-c5 and c7-c8 -- which is why those matrix slots read as empty. */
-const LAYOUT=[
+/* Physical layouts: [row, col, width-in-units].
+   Every board on this controller is five rows and four layers -- only the
+   column count changes -- so one table per column count covers the family.
+
+   65% (15 cols) is the measured one: rows total 16u, Enter absorbs the empty
+   r2c12, LShift absorbs r3c1, and Space absorbs r4 c3-c5 and c7-c8, which is
+   why those matrix slots read as empty.
+
+   60% (14 cols) follows the same conventions with the right-hand nav column
+   removed and RShift widened to take up the slack. It is a reasoned layout
+   rather than a measured one: the matrix geometry is the vendor's, but which
+   physical key sits on which slot has not been confirmed on hardware. Keys may
+   be drawn in the wrong place on a 60% board even though every value read from
+   it is correct. A diagnostic report from one owner fixes it for good.
+
+   The 6-column board is a macropad; a plain grid is the honest default. */
+const LAYOUT_65=[
  [[0,0,1],[0,1,1],[0,2,1],[0,3,1],[0,4,1],[0,5,1],[0,6,1],[0,7,1],[0,8,1],[0,9,1],
   [0,10,1],[0,11,1],[0,12,1],[0,13,2],[0,14,1]],
  [[1,0,1.5],[1,1,1],[1,2,1],[1,3,1],[1,4,1],[1,5,1],[1,6,1],[1,7,1],[1,8,1],[1,9,1],
@@ -2678,7 +2983,37 @@ const LAYOUT=[
  [[4,0,1.25],[4,1,1.25],[4,2,1.25],[4,6,6.25],[4,9,1],[4,10,1],[4,11,1],[4,12,1],
   [4,13,1],[4,14,1]],
 ];
-const idx=(r,c)=>r*15+c;
+const LAYOUT_60=[
+ [[0,0,1],[0,1,1],[0,2,1],[0,3,1],[0,4,1],[0,5,1],[0,6,1],[0,7,1],[0,8,1],[0,9,1],
+  [0,10,1],[0,11,1],[0,12,1],[0,13,2]],
+ [[1,0,1.5],[1,1,1],[1,2,1],[1,3,1],[1,4,1],[1,5,1],[1,6,1],[1,7,1],[1,8,1],[1,9,1],
+  [1,10,1],[1,11,1],[1,12,1],[1,13,1.5]],
+ [[2,0,1.75],[2,1,1],[2,2,1],[2,3,1],[2,4,1],[2,5,1],[2,6,1],[2,7,1],[2,8,1],[2,9,1],
+  [2,10,1],[2,11,1],[2,13,2.25]],
+ [[3,0,2.25],[3,2,1],[3,3,1],[3,4,1],[3,5,1],[3,6,1],[3,7,1],[3,8,1],[3,9,1],[3,10,1],
+  [3,11,1],[3,12,2.75]],
+ [[4,0,1.25],[4,1,1.25],[4,2,1.25],[4,6,6.25],[4,9,1.25],[4,10,1.25],[4,11,1.25],
+  [4,12,1.25]],
+];
+function gridLayout(cols){
+  const out=[];
+  for(let r=0;r<5;r++){const row=[];for(let c=0;c<cols;c++)row.push([r,c,1]);out.push(row);}
+  return out;
+}
+/* Columns of the connected board. Updated from /api/config once it arrives;
+   15 until then, because that is the only geometry confirmed on hardware. */
+let COLS=15;
+let LAYOUT=LAYOUT_65;
+function setGeometry(cols){
+  cols=+cols||15;
+  if(cols===COLS)return false;
+  COLS=cols;
+  LAYOUT = cols===15 ? LAYOUT_65 : cols===14 ? LAYOUT_60 : gridLayout(cols);
+  return true;
+}
+/* Matrix index is row-major over the board's own column count, so this has to
+   follow the connected board rather than assume 15. */
+const idx=(r,c)=>r*COLS+c;
 
 /* keycode names, mirroring src/mad68/keycodes.py */
 const KC={};
@@ -2835,6 +3170,9 @@ async function post(p,b){const r=await fetch(p,{method:"POST",
   throw new Error(j.error);} return j.result;}
 async function loadConfig(){try{config=await(await fetch("/api/config")).json();}
   catch(e){toast("could not read the keyboard",true);}
+  // The board reports its own matrix, so the drawing follows the hardware
+  // rather than the geometry this driver happened to be written against.
+  if(config&&config.cols)setGeometry(config.cols);
   drawVersionBanner();}
 /* Key bindings live on the keyboard, not in a profile, and switching profiles
    deliberately does not rewrite them. This says which profiles currently share
@@ -3617,11 +3955,38 @@ function pageHTML(){
     return `<div class="center">${boardHTML("keys")}</div>
       <div class="panel" style="max-width:760px;margin:22px auto 0">
         <div class="row" style="padding:14px 0;border-bottom:1px solid var(--panel-brd)">
-          <div><b>Keyboard protocol version ${config.protocol_version}</b>
-            <div class="sub">Flashing is not implemented here. The official
-              configurator does it.</div></div>
+          <div><b>${config.board||"Keyboard"} &middot; protocol version ${config.protocol_version}</b>
+            <div class="sub">${config.rows||"?"} &times; ${config.cols||"?"} matrix,
+              ${config.total_keys||"?"} keys. Flashing is not implemented here;
+              the official configurator does it.</div></div>
           <button class="spacer" id="fw-open"
             title="Opens the official configurator in a new tab">Update firmware &#8599;</button></div>
+
+        <div class="row" style="padding:14px 0;border-bottom:1px solid var(--panel-brd)">
+          <div>Send a board report
+            <div class="sub">${config.board_verified
+              ? "This board is already confirmed working. A report is still useful if something looks wrong."
+              : "This board has not been confirmed on hardware yet. One report is what gets it supported properly."}
+              <label class="f" style="margin-top:8px">
+                <input type="checkbox" id="diag-write"> Include a write test
+              </label>
+              <div class="sub" style="margin-top:4px">Writes one actuation value,
+                reads it back and restores it. Volatile, so it costs no flash
+                and would not survive a replug even if it failed. It is the only
+                way to prove writing works on an untested board.</div>
+            </div>
+          <button class="spacer${config.board_verified?"":" primary"}" id="diag-send"
+            >Generate report&hellip;</button></div>
+
+        ${config.board_verified ? "" : `
+        <div class="row" style="padding:14px 0;border-bottom:1px solid var(--panel-brd)">
+          <div>${config.board_unlocked ? "Writing is unlocked on this board"
+                                       : "Enable writing on this board"}
+            <div class="sub">${config.board_unlocked
+              ? "You enabled writing despite this model being unconfirmed. Turn it back off if anything behaves oddly."
+              : "Settings are read-only because nobody has confirmed this driver against this model. Reading is always safe; writing uses packet offsets taken from a different board."}</div></div>
+          <button class="spacer${config.board_unlocked?" danger":""}" id="board-unlock"
+            >${config.board_unlocked ? "Make read-only again" : "Enable writing…"}</button></div>`}
         <div class="row" style="padding:14px 0;border-bottom:1px solid var(--panel-brd)">
           <div>The key bindings will be restored to the factory state.
             <div class="sub">Resets the dynamic keymap only.</div></div>
@@ -4332,6 +4697,33 @@ function wirePage(root){
 
   if(tab==="Other Settings"){
     on("fw-open",()=>{window.open(FIRMWARE_URL,"_blank","noopener");});
+    on("diag-send",async()=>{
+      const b=el("diag-send"), wp=el("diag-write")&&el("diag-write").checked;
+      if(b){b.disabled=true;b.textContent=wp?"Testing board…":"Reading board…";}
+      let r;
+      try{ r=await post("/api/diagnostic-report",{write_probe:!!wp}); }
+      catch(e){ if(b){b.disabled=false;b.textContent="Generate report…";} return; }
+      if(b){b.disabled=false;b.textContent="Generate report…";}
+      showDiagReport(r);
+    });
+    on("board-unlock",async()=>{
+      if(config.board_unlocked){
+        await post("/api/board/unlock",{enabled:false});
+        toast("this board is read-only again");
+        await loadConfig(); draw(); return;
+      }
+      // Typed, not ticked. Same shape as the factory-reset confirmation.
+      if(!confirm("Enable writing on an unconfirmed board?\\n\\n"+
+        "This driver's packet offsets were confirmed on a different model. "+
+        "Reading is always safe. Writing may put values in the wrong place, "+
+        "which a factory reset can undo but which you should expect.\\n\\n"+
+        "Send a board report first if you have not already."))return;
+      if(prompt("Type I UNDERSTAND to enable writing:")!=="I UNDERSTAND"){
+        toast("cancelled");return;}
+      await post("/api/board/unlock",{enabled:true,confirm:"I UNDERSTAND"});
+      toast("writing enabled on this board");
+      await loadConfig(); draw();
+    });
     on("prof-export",async()=>{
       const r=await post("/api/profile/export",{name:editing});
       toast(r.saved?`exported ${editing}`:"export cancelled");});
@@ -4447,6 +4839,66 @@ function openSettings(){
       await refreshProfiles();draw();}
     else if(!r.skipped.length)toast("import cancelled");};
   q("set-close").onclick=()=>{m.innerHTML="";};
+}
+
+/* Board report.
+   Shows the whole payload before anything leaves the machine, because asking
+   someone to send diagnostics from their hardware without letting them read it
+   first is not a reasonable thing to do. The file is already on disk; the
+   button only opens a prefilled issue for them to attach it to. */
+function showDiagReport(r){
+  const mb=$("#modal");
+  const d=(r.report&&r.report.device)||{}, f=(r.report&&r.report.firmware)||{};
+  const wp=(r.report&&r.report.write_probe)||{ran:false};
+  const pretty=JSON.stringify(r.report,null,1);
+  const wpNote = !wp.ran ? "" :
+    `<div class="kmnote ${wp.match&&wp.restored!==false?"ok":"warn2"}" style="margin-top:12px">
+       <span class="kmicon">${wp.match&&wp.restored!==false?"&#10003;":"&#9888;"}</span>
+       <div class="kmbody"><b>Write test:</b> ${
+         wp.error ? "failed &mdash; "+wp.error
+         : (wp.match ? "wrote "+wp.wrote_mm+" mm and read it back correctly, so "
+                      +"the write path works on this board."
+                     : "wrote "+wp.wrote_mm+" mm but read back "+wp.read_back_mm
+                      +" mm &mdash; the write offsets do not match this board.")}
+         ${wp.restored===false
+           ? "<br><b>The original value could not be restored.</b> It was a "
+             +"volatile write, so replugging the keyboard clears it."
+           : (wp.original_mm!==undefined
+              ? "<br>Original "+wp.original_mm+" mm restored." : "")}
+       </div></div>`;
+  mb.innerHTML=`<div class="modal"><div class="box" style="max-width:680px">
+    <h2>Board report ready</h2>
+    <div class="sub" style="margin-top:10px">
+      Saved to <code>${r.path}</code></div>
+
+    <div class="kmnote ok" style="margin-top:16px">
+      <span class="kmicon">&#9432;</span>
+      <div class="kmbody">
+        <b>${d.registry_name||"Unknown board"}</b> ·
+        <code>${d.vendor_id}:${d.product_id}</code> ·
+        protocol ${f.protocol_version}<br>
+        This contains only what the keyboard reports. <b>No serial number,
+        no profiles, no app rules</b> — nothing that identifies you or your PC.
+      </div></div>
+    ${wpNote}
+
+    <div class="sub" style="margin-top:14px">Full contents:</div>
+    <pre style="margin-top:6px;max-height:220px;overflow:auto;background:var(--field);
+                padding:12px;border-radius:var(--radius);font-size:11px;
+                white-space:pre-wrap">${pretty.replace(/</g,"&lt;")}</pre>
+
+    <div class="row" style="margin-top:20px"><span class="spacer"></span>
+      <button id="dg-close">Close</button>
+      <button id="dg-copy">Copy JSON</button>
+      <button class="primary" id="dg-open">Open a report on GitHub</button></div>
+  </div></div>`;
+  const on2=(id,fn)=>{const e=mb.querySelector("#"+id); if(e)e.onclick=fn;};
+  on2("dg-close",()=>{mb.innerHTML="";});
+  on2("dg-copy",async()=>{
+    try{await navigator.clipboard.writeText(pretty);toast("report copied");}
+    catch(e){toast("could not copy",true);}});
+  on2("dg-open",()=>{window.open(r.issue_url,"_blank","noopener");
+    toast("attach the saved file to the issue");});
 }
 
 /* Update dialog.

@@ -1,4 +1,4 @@
-"""Named, file-based configuration profiles for the MAD68 HE.
+"""Named, file-based configuration profiles for Madlions HE keyboards.
 
 A profile is a declarative description of *what the keyboard should be*. Applying
 one diffs it against the live device and writes only the fields that actually

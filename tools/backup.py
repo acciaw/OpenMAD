@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Full onboard-memory backup for the MAD68 HE.
+"""Full onboard-memory backup for Madlions HE keyboards.
 
 This is the safety gate for the whole project: nothing in this repo should write
 to the keyboard until a backup exists and has been verified.

@@ -1,4 +1,4 @@
-"""Structured types for the MAD68 HE's advanced features.
+"""Structured types for the keyboard's advanced features.
 
 Layouts recovered from the web configurator's DuckBread packet classes. Byte
 offsets below are into the 32-byte report (raw[...]), with the vendor channel

@@ -1,4 +1,4 @@
-"""HID transport for the MAD68 HE config interface (VIA protocol).
+"""HID transport for the DuckBread config interface (VIA protocol).
 
 Safety model: the handle is read-only unless constructed with writes=True, and
 destructive commands (EEPROM reset, keymap reset, bootloader jump, calibration,
@@ -15,6 +15,7 @@ from typing import Iterator
 
 import hid
 
+from . import devices
 from .protocol import (
     ACTUATION_ENTRY_V2,
     BOOTLOADER_PRODUCT_ID,
@@ -29,6 +30,7 @@ from .protocol import (
     DANGEROUS_VENDOR,
     KEYCODE_SIZE,
     KEYMAP_SIZE,
+    KNOWN_PROTOCOL_VERSION,
     LAYER_COUNT,
     MATRIX_COLS,
     MATRIX_ROWS,
@@ -115,46 +117,109 @@ def find_interfaces() -> list[dict]:
 
 
 def in_bootloader() -> bool:
-    return bool(hid.enumerate(VENDOR_ID, BOOTLOADER_PRODUCT_ID))
+    """True if any known board is sitting in its bootloader.
+
+    Every board has its own bootloader PID, so the whole set has to be
+    considered -- but as a single vendor-wide enumeration filtered in Python,
+    not one call per ID. See find_config_interface for why.
+    """
+    return any(int(d.get("product_id") or 0) in devices.BOOTLOADER_IDS
+               for d in hid.enumerate(VENDOR_ID, 0))
 
 
-def find_config_interface(product_id: int = PRODUCT_ID) -> dict:
-    """The raw-HID config interface (usage page 0xFF60, usage 0x61)."""
+def find_config_interface(product_id: int | None = None) -> dict:
+    """The raw-HID config interface (usage page 0xFF60, usage 0x61).
+
+    With no product_id, any board in the registry will do and the lowest ID
+    present wins. Pinning to a single PID was what limited this driver to one
+    keyboard: the config interface is a property of the controller, and the
+    controller is shared across the whole family.
+
+    One vendor-wide enumeration, filtered here, rather than one call per
+    registered ID. The obvious version -- looping hid.enumerate over all 25
+    PIDs -- measured 35 ms against 8.5 ms for the single call, and the switcher
+    opens the device on every profile apply, so that would have made every
+    supported board pay four times over for the privilege of supporting the
+    other twenty-four.
+    """
     candidates = [
         d
-        for d in hid.enumerate(VENDOR_ID, product_id)
+        for d in hid.enumerate(VENDOR_ID, 0)
         if d.get("usage_page") == USAGE_PAGE and d.get("usage") == USAGE
+        and (product_id is None
+             or int(d.get("product_id") or 0) == product_id)
+        and (product_id is not None
+             or int(d.get("product_id") or 0) in devices.BY_PRODUCT_ID)
     ]
+
     if not candidates:
         if in_bootloader():
             raise DeviceNotFound(
-                "keyboard is in BOOTLOADER mode (PID "
-                f"{BOOTLOADER_PRODUCT_ID:#06x}) -- unplug and replug it to return "
-                "to normal operation."
+                "keyboard is in BOOTLOADER mode -- unplug and replug it to "
+                "return to normal operation."
             )
         raise DeviceNotFound(
             f"no interface with usage page {USAGE_PAGE:#06x} / usage {USAGE:#04x} "
-            f"for {VENDOR_ID:#06x}:{product_id:#06x}. Is the keyboard connected "
+            f"for any known board on {VENDOR_ID:#06x}. Is the keyboard connected "
             f"directly, rather than through a hub or KVM that filters HID?"
         )
-    if len(candidates) > 1:
-        paths = ", ".join(repr(c["path"]) for c in candidates)
-        raise Mad68Error(f"expected one config interface, found {len(candidates)}: {paths}")
+
+    # More than one board plugged in at once is legitimate; the driver just has
+    # to pick one deterministically rather than fail.
+    candidates.sort(key=lambda c: (c.get("product_id", 0), str(c.get("path"))))
     return candidates[0]
 
 
 class Mad68:
-    """A connected MAD68 HE config interface."""
+    """A connected DuckBread-family config interface."""
 
     def __init__(self, *, writes: bool = False, dangerous: bool = False,
-                 timeout_ms: int = 1000, product_id: int = PRODUCT_ID):
+                 timeout_ms: int = 1000, product_id: int | None = None,
+                 allow_unverified: bool = False):
         self._writes = writes
         self._dangerous = dangerous
         self._timeout_ms = timeout_ms
         self._product_id = product_id
+        # Firmware whose protocol version this driver has not been checked
+        # against is read-only unless the caller says otherwise. See the gate in
+        # transfer() for why reads are exempt.
+        self._allow_unverified = allow_unverified
         self._dev: hid.device | None = None
         self.info: dict = {}
         self._populated: list[bool] | None = None
+        # Filled in by open(): which board this is, and what firmware it runs.
+        # Cached privately because protocol_version() is a method on this class
+        # and callers already depend on it.
+        self.spec: devices.BoardSpec = devices.DEFAULT_BOARD
+        self._protocol_version: int | None = None
+
+    # geometry
+    #
+    # Read from the connected board rather than from module constants, because
+    # the family spans 5x14, 5x15 and 5x6 matrices. The module constants remain
+    # as the defaults for code that has no device in hand.
+
+    @property
+    def total_keys(self) -> int:
+        return self.spec.total_keys
+
+    @property
+    def matrix_rows(self) -> int:
+        return self.spec.rows
+
+    @property
+    def matrix_cols(self) -> int:
+        return self.spec.cols
+
+    @property
+    def firmware_version(self) -> int | None:
+        """Protocol version read at open, or None if the board did not answer."""
+        return self._protocol_version
+
+    @property
+    def firmware_verified(self) -> bool:
+        """Whether this firmware reports the protocol version we were built on."""
+        return self._protocol_version == KNOWN_PROTOCOL_VERSION
 
     # lifecycle
 
@@ -165,6 +230,22 @@ class Mad68:
         dev.set_nonblocking(0)
         self._dev = dev
         self.info = iface
+        pid = int(iface.get("product_id") or 0)
+        self.spec = devices.describe(pid)
+        # A board the user has deliberately unlocked writes like a verified one.
+        # Consulted here rather than passed in, so every entry point -- HUD,
+        # tray switcher, CLI -- honours the same decision without plumbing.
+        if devices.is_unlocked(pid):
+            self._allow_unverified = True
+
+        # One extra packet at open, so the write gate has something to decide
+        # on. Cheap next to the round trips any real operation costs, and it
+        # has to happen before the first write rather than after it. A board
+        # that will not answer stays None, which the gate treats as unverified.
+        try:
+            self._protocol_version = self.protocol_version()
+        except Exception:
+            self._protocol_version = None
         return self
 
     def close(self) -> None:
@@ -226,6 +307,55 @@ class Mad68:
                 f"{cmd.name} wipes onboard state or reboots to bootloader; "
                 f"needs Mad68(writes=True, dangerous=True)."
             )
+
+        # Anything unconfirmed is read-only.
+        #
+        # Two separate questions have to both come out yes, because they are
+        # different kinds of evidence:
+        #
+        #   firmware_verified -- does this board report the protocol version
+        #       every packet layout in protocol.py was derived from? A
+        #       different version means the wire format may have moved.
+        #   spec.verified -- has this *model* actually been run against this
+        #       driver by someone? The board list came out of the vendor's
+        #       JavaScript bundle, so a matching protocol version is a strong
+        #       inference that the layouts hold, but it is still an inference.
+        #       It says nothing about LED count, which vendor sub-commands the
+        #       model implements, or anything else that varies per board.
+        #
+        # Reads are exempt on purpose. Reading a wrong offset costs nothing --
+        # the worst case is a value displayed as nonsense, which is visible and
+        # harmless. Writing a wrong offset puts arbitrary bytes into whichever
+        # setting actually lives there. So an unconfirmed board stays fully
+        # inspectable and diagnosable, which is what makes a useful report
+        # possible, while being unable to damage anything.
+        #
+        # A board that did not answer the version query at all is unverified
+        # too -- silence is not evidence of a match.
+        #
+        # The user can lift this per board from Other Settings; that path sets
+        # allow_unverified via devices.is_unlocked() and asks for a typed
+        # confirmation first.
+        if (cmd in WRITE_COMMANDS
+                and self._writes
+                and not self._allow_unverified
+                and not (self.firmware_verified and self.spec.verified)):
+            got = ("no answer" if self._protocol_version is None
+                   else str(self._protocol_version))
+            if not self.firmware_verified:
+                why = (f"it reports protocol version {got}, and this driver's "
+                       f"packet layouts were only confirmed against version "
+                       f"{KNOWN_PROTOCOL_VERSION}")
+            else:
+                why = (f"the {self.spec.name} has never been run against this "
+                       f"driver -- its support is inferred from sharing a "
+                       f"controller with a board that has")
+            raise WriteBlocked(
+                f"{cmd.name} refused: {why}. Reading is safe and stays enabled. "
+                f"Enable writing for this board in Other Settings, or send a "
+                f"board report so it can be supported properly."
+            )
+
         if cmd in WRITE_COMMANDS and not self._writes:
             raise WriteBlocked(
                 f"{cmd.name} mutates onboard memory and this handle is read-only. "
@@ -476,7 +606,7 @@ class Mad68:
 
     def read_actuation_bulk(self, offset: int = 0, count: int | None = None) -> list[float]:
         """Actuation points in mm for count keys starting at key index offset."""
-        total = TOTAL_KEYS - offset if count is None else count
+        total = self.total_keys - offset if count is None else count
         out: list[float] = []
         while len(out) < total:
             want = min(MAX_ACTUATION_READ, total - len(out))
@@ -495,7 +625,7 @@ class Mad68:
     def read_rapid_trigger_bulk(self, offset: int = 0,
                                 count: int | None = None) -> list[RapidTrigger]:
         """Rapid-trigger settings for count keys starting at key index offset."""
-        total = TOTAL_KEYS - offset if count is None else count
+        total = self.total_keys - offset if count is None else count
         out: list[RapidTrigger] = []
         while len(out) < total:
             want = min(MAX_RT_READ, total - len(out))
@@ -609,13 +739,13 @@ class Mad68:
     def read_adc_raw(self, count: int | None = None) -> list[int]:
         """Raw per-key sensor values. Higher/lower is switch dependent."""
         return self._read_u16_bulk(
-            Vendor.REALTIME_ADC_AXLE_BUFFER, TOTAL_KEYS if count is None else count
+            Vendor.REALTIME_ADC_AXLE_BUFFER, self.total_keys if count is None else count
         )
 
     def read_trip_raw(self, count: int | None = None) -> list[int]:
         """Per-key trip/travel values; 0 for a key that is not pressed."""
         return self._read_u16_bulk(
-            Vendor.REALTIME_TRIP_AXLE_BUFFER, TOTAL_KEYS if count is None else count
+            Vendor.REALTIME_TRIP_AXLE_BUFFER, self.total_keys if count is None else count
         )
 
     def read_trip_mm(self, row: int, col: int) -> float:
@@ -643,12 +773,12 @@ class Mad68:
             try:
                 self._populated = [bool(v) for v in self.read_calibration_status()]
             except Exception:
-                self._populated = [True] * TOTAL_KEYS
+                self._populated = [True] * self.total_keys
         return self._populated
 
     def read_calibration_status(self, count: int | None = None) -> list[int]:
         """Per-key calibration flag; 1 means calibrated. Read-only."""
-        total = TOTAL_KEYS if count is None else count
+        total = self.total_keys if count is None else count
         out: list[int] = []
         per_packet = REPORT_SIZE - BULK_READ_DATA_AT
         while len(out) < total:
@@ -799,16 +929,16 @@ class Mad68:
     def read_all_key_colors(self) -> list[tuple[int, int, int]]:
         """Per-key RGB for every matrix position, in linear key order."""
         out: list[tuple[int, int, int]] = []
-        while len(out) < TOTAL_KEYS:
+        while len(out) < self.total_keys:
             idx = len(out)
-            want = min(self.MAX_RGB_PER_PACKET, TOTAL_KEYS - idx)
+            want = min(self.MAX_RGB_PER_PACKET, self.total_keys - idx)
             out.extend(self.read_key_colors(idx // MATRIX_COLS, idx % MATRIX_COLS, want))
-        return out[:TOTAL_KEYS]
+        return out[:self.total_keys]
 
     def write_all_key_colors(self, colors: list[tuple[int, int, int]]) -> int:
         packets = 0
         i = 0
-        while i < min(len(colors), TOTAL_KEYS):
+        while i < min(len(colors), self.total_keys):
             chunk = colors[i:i + self.MAX_RGB_PER_PACKET]
             self.write_key_colors(i // MATRIX_COLS, i % MATRIX_COLS, chunk)
             packets += 1

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Restore onboard configuration to the MAD68 HE from a backup file.
+"""Restore onboard configuration from a backup file.
 
 Defaults to a dry run: it reads the device, diffs against the backup and prints
 exactly what it would write, touching nothing. Pass --apply to actually write.
