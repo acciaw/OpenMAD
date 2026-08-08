@@ -19,6 +19,8 @@ This project was done using generative AI to make reverse-engineering the manufa
 I have spent quite a few hours gathering a good understanding of how the stock software handled everything to ensure my project is safe to use and won't brick anyone's board.
 That being said, if you have a different keyboard which uses Madlion's web driver and would like to collaborate, don't hesitate to contact me to make OpenMAD better for everyone.
 
+---
+
 ## Install
 
 Download `OpenMAD-Setup-x.y.z.exe` from the releases page and run it. It installs
