@@ -28,6 +28,7 @@ from .features import AdvancedKey, BoxLight, DeadBand, Dks, DksAction
 from .features import KeyboardFeature, LightInfo, MacroStep
 from .keycodes import label
 from .paths import assets_dir
+from .updater import UPDATER, frozen_install_supported, pick_installer_asset
 from .profile import (
     PER_KEY_EFFECT,
     Profile,
@@ -573,6 +574,11 @@ def check_for_update(timeout: float = 6.0) -> dict:
                 "current": APP_VERSION}
     tag = data.get("tag_name") or ""
     newer = _version_tuple(tag) > _version_tuple(APP_VERSION)
+    # The installer attached to the release is what makes updating in place
+    # possible. A release without one is still reportable, it just has to send
+    # the user to the page instead of offering a button that cannot work.
+    asset = pick_installer_asset(data.get("assets") or [])
+    supported, why = frozen_install_supported()
     return {
         "checked": True,
         "update": newer,
@@ -580,7 +586,25 @@ def check_for_update(timeout: float = 6.0) -> dict:
         "latest": tag.lstrip("v"),
         "url": data.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases",
         "notes": (data.get("body") or "")[:600],
+        "asset": asset,
+        "can_install": bool(newer and asset and supported),
+        "install_note": why if not supported else (
+            "" if asset else
+            "This release has no installer attached, so it has to be "
+            "downloaded from the releases page."),
     }
+
+
+def _default_exit() -> None:
+    os._exit(0)
+
+
+# How the app shuts itself down once the update installer is running. The tray
+# replaces this with its own quit handler, which stops the switcher, closes the
+# device and removes the icon; the hard exit is the fallback for `python
+# tools/hud.py`, where there is no tray to ask. Either way the process has to
+# end, because the installer cannot overwrite an executable that is still open.
+EXIT_HOOK = _default_exit
 
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _-]{0,39}$")
@@ -873,6 +897,8 @@ def make_handler(sampler: Sampler):
                     self._json({"error": str(exc)}, 503)
             elif path == "/api/update-check":
                 self._json(check_for_update())
+            elif path == "/api/update/status":
+                self._json(UPDATER.snapshot())
             elif path == "/api/profile":
                 # path already has the query stripped, so match on the bare
                 # path and pull the name out of self.path.
@@ -1411,6 +1437,31 @@ def make_handler(sampler: Sampler):
                 st.save(s_path)
                 return {"check_updates": st.check_updates,
                         "start_at_login": get_start_at_login()}
+
+            # in-app update
+
+            if path == "/api/update/download":
+                # The asset is re-fetched from GitHub rather than taken from the
+                # request body: the browser must not get to name the URL or the
+                # expected hash of something this process is going to execute.
+                info = check_for_update()
+                if not info.get("checked"):
+                    raise ValueError(info.get("error") or "could not reach GitHub")
+                if not info.get("update"):
+                    raise ValueError("already up to date")
+                asset = info.get("asset")
+                if not asset:
+                    raise ValueError("this release has no installer attached")
+                supported, why = frozen_install_supported()
+                if not supported:
+                    raise ValueError(why)
+                return UPDATER.start(asset, version=info.get("latest", ""))
+
+            if path == "/api/update/install":
+                # Shutting down is what lets the installer replace the running
+                # executable, so the reply is sent first and the app quits a
+                # moment later.
+                return UPDATER.install(on_exit=EXIT_HOOK)
 
             # profile export / import
 
@@ -2404,6 +2455,12 @@ main { min-width: 0; }
 .kmnote .kmbody { flex: 1 1 auto; min-width: 0; }
 .kmnote b { color: var(--ink); }
 .kmnote .row { margin-top: 10px; }
+
+/* update download progress */
+.uprog { margin-top: 16px; height: 8px; border-radius: 999px;
+         background: rgba(255,255,255,.10); overflow: hidden; }
+.upbar { height: 100%; background: var(--accent); border-radius: 999px;
+         transition: width .2s ease; }
 
 /* Shown across every tab when the keyboard reports a protocol version this
    driver has not been checked against. Sits above the tab strip rather than
@@ -4392,17 +4449,99 @@ function openSettings(){
   q("set-close").onclick=()=>{m.innerHTML="";};
 }
 
+/* Update dialog.
+   Installing happens here rather than on the releases page: download, run the
+   installer, and let it bring the app back. u.can_install is false when there
+   is no installer attached to the release or we are running from source, and
+   then the only honest option is still the page. */
 function showUpdate(u){
-  $("#modal").innerHTML=`<div class="modal"><div class="box" style="max-width:520px">
-    <h2>Update available</h2>
-    <div style="margin-top:12px">Version <b>${u.latest}</b> is out.
-      You have ${u.current}.</div>
-    ${u.notes?`<div class="sub" style="margin-top:12px; white-space:pre-wrap; max-height:220px; overflow:auto">${u.notes}</div>`:""}
-    <div class="row" style="margin-top:20px"><span class="spacer"></span>
-      <button id="up-later">Later</button>
-      <a class="btn primary" href="${u.url}" target="_blank" rel="noopener">Open releases</a></div>
-  </div></div>`;
-  $("#modal").querySelector("#up-later").onclick=()=>{$("#modal").innerHTML="";};
+  const mb=$("#modal");
+  const bytes=n=>n>=1048576?(n/1048576).toFixed(1)+" MB"
+              :n>=1024?Math.round(n/1024)+" KB":n+" B";
+
+  const render=(st)=>{
+    const busy=st&&(st.state==="downloading"||st.state==="installing");
+    let action;
+    if(!u.can_install){
+      action=`<a class="btn primary" href="${u.url}" target="_blank"
+                 rel="noopener">Open releases</a>`;
+    }else if(st&&st.state==="ready"){
+      action=`<button class="primary" id="up-install">Install and restart</button>`;
+    }else if(busy){
+      action=`<button class="primary" disabled>${
+        st.state==="installing"?"Installing…":"Downloading…"}</button>`;
+    }else{
+      action=`<button class="primary" id="up-go">Install update</button>`;
+    }
+
+    let body="";
+    if(st&&st.state==="downloading"){
+      body=`<div class="uprog"><div class="upbar" style="width:${st.percent}%"></div></div>
+            <div class="sub" style="margin-top:6px">${bytes(st.done)}${
+              st.total?" of "+bytes(st.total):""} — ${st.percent}%</div>`;
+    }else if(st&&st.state==="ready"){
+      body=`<div class="sub" style="margin-top:12px">Downloaded and verified.
+              The app will close, update, and start again on its own.</div>`;
+    }else if(st&&st.state==="installing"){
+      body=`<div class="sub" style="margin-top:12px">Installing. The app is about
+              to close and will come back in a few seconds.</div>`;
+    }else if(st&&st.state==="error"){
+      body=`<div class="kmnote warn2" style="margin-top:12px">
+              <span class="kmicon">&#9888;</span>
+              <div class="kmbody">${st.error||"the update failed"}
+                <div class="row" style="margin-top:10px">
+                  <a class="btn" href="${u.url}" target="_blank" rel="noopener"
+                    >Download it manually</a></div></div></div>`;
+    }else{
+      body=(u.notes?`<div class="sub" style="margin-top:12px; white-space:pre-wrap;
+                       max-height:200px; overflow:auto">${u.notes}</div>`:"")
+         +(u.install_note?`<div class="sub" style="margin-top:12px"
+                             >${u.install_note}</div>`:"");
+    }
+
+    mb.innerHTML=`<div class="modal"><div class="box" style="max-width:520px">
+      <h2>Update available</h2>
+      <div style="margin-top:12px">Version <b>${u.latest}</b> is out.
+        You have ${u.current}.</div>
+      ${body}
+      <div class="row" style="margin-top:20px"><span class="spacer"></span>
+        ${busy?"":`<button id="up-later">Later</button>`}
+        ${action}</div>
+    </div></div>`;
+
+    const on=(id,fn)=>{const e=mb.querySelector("#"+id); if(e)e.onclick=fn;};
+    on("up-later",()=>{mb.innerHTML="";});
+    on("up-go",async()=>{
+      render({state:"downloading",percent:0,done:0,total:u.asset?u.asset.size:0});
+      try{ await post("/api/update/download",{}); }
+      catch(e){ render({state:"error",error:String(e.message||e)}); return; }
+      poll();
+    });
+    on("up-install",async()=>{
+      render({state:"installing"});
+      // The app quits about a second after this returns, so there is no reply
+      // to wait for and no further UI to draw.
+      try{ await post("/api/update/install",{}); }
+      catch(e){ render({state:"error",error:String(e.message||e)}); }
+    });
+  };
+
+  let timer=null;
+  const poll=async()=>{
+    clearTimeout(timer);
+    let st;
+    try{ st=await(await fetch("/api/update/status")).json(); }
+    catch(e){ return; }
+    render(st);
+    if(st.state==="downloading")timer=setTimeout(poll,400);
+  };
+
+  render(null);
+  // Join a download already running, so reopening the dialog shows progress
+  // rather than offering to start a second one.
+  fetch("/api/update/status").then(r=>r.json()).then(st=>{
+    if(st&&st.state!=="idle"){render(st); if(st.state==="downloading")poll();}
+  }).catch(()=>{});
 }
 
 /* Startup check. Silent unless there is something to report -- an "up to date"
