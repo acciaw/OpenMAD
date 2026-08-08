@@ -330,6 +330,21 @@ ANIMATED_EFFECTS = frozenset({6, 7, 8, 9, 11, 13, 19, 23, 26, 28, 31, 36, 39})
 # Speed to use when an animated effect is asked for with no usable speed.
 DEFAULT_EFFECT_SPEED = 128
 
+# Lighting effects that take a single colour from the LightInfo packet.
+#
+# From the same stock table as ANIMATED_EFFECTS: an effect is listed here when
+# it carries a colour entry. 1 (Customization) is deliberately absent -- it
+# renders the per-key colour table instead, so the packet's colour is not what
+# you see, and forcing one would override the user's own key colours.
+COLOUR_EFFECTS = frozenset({2, 3, 4, 5, 6, 7, 8, 9, 11, 26, 28, 31, 36})
+
+# Colour to use when a colour-driven effect is asked for without one set.
+#
+# Black is not something the LEDs can render. It collapses these effects to a
+# single dead hue, which is what made the two Rainbow static modes stop looking
+# like rainbows in any profile where a colour had never been picked.
+DEFAULT_EFFECT_COLOUR = (255, 255, 255)
+
 
 def _apply_gain(value: int, gain: float) -> int:
     return max(0, min(255, round(value * gain)))

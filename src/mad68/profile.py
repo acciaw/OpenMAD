@@ -34,6 +34,8 @@ from .features import (
 )
 from .protocol import (
     ANIMATED_EFFECTS,
+    COLOUR_EFFECTS,
+    DEFAULT_EFFECT_COLOUR,
     DEFAULT_EFFECT_SPEED,
     KEYCODE_SIZE,
     MATRIX_COLS,
@@ -440,6 +442,15 @@ class Profile:
             if (fields.get("effect") in ANIMATED_EFFECTS
                     and not 1 <= fields.get("speed", 0) <= 255):
                 fields["speed"] = DEFAULT_EFFECT_SPEED
+            # Same shape of bug in the colour: a profile that has never had one
+            # picked carries r=g=b=0, and the firmware renders black as one dead
+            # hue rather than the effect. Applying such a profile from the tray
+            # is how a rainbow came up as a single colour without the HUD ever
+            # being opened.
+            if (fields.get("effect") in COLOUR_EFFECTS
+                    and not any((fields.get("r", 0), fields.get("g", 0),
+                                 fields.get("b", 0)))):
+                (fields["r"], fields["g"], fields["b"]) = DEFAULT_EFFECT_COLOUR
             want_li = LightInfo(**fields)
             try:
                 have_li = kb.read_light_info()

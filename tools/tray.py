@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import pystray  # noqa: E402
 from PIL import Image, ImageDraw  # noqa: E402
 
+from mad68.paths import assets_dir, data_dir, seed_user_data  # noqa: E402
 from mad68.switcher import (  # noqa: E402
     SwitchEvent,
     Switcher,
@@ -35,16 +36,14 @@ from mad68.switcher import (  # noqa: E402
     foreground_app,
 )
 
-# When packaged as an exe, PyInstaller provides sys._MEIPASS pointing to the bundle.
-# Assets are extracted to this location. In development, resolve relative to the repo.
-if getattr(sys, "_MEIPASS", None):
-    REPO = Path(sys._MEIPASS)
-else:
-    REPO = Path(__file__).resolve().parent.parent
-
-PROFILE_DIR = REPO / "profiles"
-CONFIG_PATH = REPO / "switcher.json"
-LOG_PATH = REPO / "switcher.log"
+# Bundled resources and the user's data are different places in a packaged
+# build; see mad68.paths. Writing the config beside the resources put it in a
+# directory PyInstaller deletes on exit, which is why no setting survived a
+# reboot.
+DATA_DIR = data_dir()
+PROFILE_DIR = seed_user_data()
+CONFIG_PATH = DATA_DIR / "switcher.json"
+LOG_PATH = DATA_DIR / "switcher.log"
 HUD_PORT = 8787
 
 def server_is_current(port: int) -> bool:
@@ -94,8 +93,9 @@ COLOURS = {
 
 
 # Drop an icon.ico here and the tray uses it. Loaded once and cached, because
-# pystray re-reads the icon on every state change.
-ICON_PATH = REPO / "assets" / "icon.ico"
+# pystray re-reads the icon on every state change. A resource, not user data:
+# it ships inside the executable.
+ICON_PATH = assets_dir() / "icon.ico"
 _icon_cache: dict[str, Image.Image] = {}
 
 
