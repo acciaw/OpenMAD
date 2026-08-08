@@ -32,6 +32,9 @@ onboard.json
 # Development scratch, not part of the shipped app
 dev/
 
+# Website
+website/
+
 # Editors and OS
 .vscode/
 .idea/
