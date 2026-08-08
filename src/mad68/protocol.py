@@ -1,4 +1,4 @@
-"""Wire protocol for the MAD68 HE onboard configuration interface.
+"""Wire protocol for the DuckBread onboard configuration interface.
 
 The keyboard speaks the VIA raw-HID protocol (32-byte reports, byte 0 is the
 command ID) plus a vendor "custom channel" 0x96 that carries all the

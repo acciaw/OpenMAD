@@ -1,4 +1,7 @@
-"""Local driver for the MAD68 HE magnetic-switch keyboard (VIA protocol)."""
+"""Local driver for Madlions magnetic-switch keyboards (VIA protocol).
+
+Supports the DuckBread controller family; see mad68.devices for the board list.
+"""
 
 from .device import (
     DeviceNotFound,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpenMAD system-tray app for the MAD68 HE keyboard.
+"""OpenMAD system-tray app for Madlions HE keyboards.
 
 Runs the app-aware profile switcher in the background and exposes it from the
 tray: current profile, manual override, auto-switch toggle, and a live view of
@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import pystray  # noqa: E402
 from PIL import Image, ImageDraw  # noqa: E402
 
+from mad68 import devices  # noqa: E402
 from mad68.paths import assets_dir, data_dir, seed_user_data  # noqa: E402
 from mad68.switcher import (  # noqa: E402
     SwitchEvent,
@@ -45,6 +46,16 @@ PROFILE_DIR = seed_user_data()
 CONFIG_PATH = DATA_DIR / "switcher.json"
 LOG_PATH = DATA_DIR / "switcher.log"
 HUD_PORT = 8787
+
+# Which boards the user unlocked for writing despite unverified firmware.
+#
+# Loaded here as well as in hud.serve(), because the switcher writes to the
+# keyboard on its own -- it does not go through the HUD. Without this, someone
+# on an unconfirmed board who unlocked writing would find auto-switching had
+# silently stopped after a reboot: the tray starts, they never open the
+# configurator, so nothing ever read the unlock file and every apply was
+# refused as read-only.
+devices.load_unlocked(DATA_DIR / "unlocked_boards.json")
 
 def server_is_current(port: int) -> bool:
     """True only if our HUD is on that port AND running the same code we are."""
