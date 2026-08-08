@@ -1,6 +1,6 @@
 # OpenMAD
 
-[![Logo](assets/logo.png)](https://sisyphe.acciaw.me)
+[![Logo](assets/logo.png)](https://openmad.accw.dev)
 
 [![Static Badge](https://img.shields.io/badge/License-GNU%20GPLv3-green)](https://creativecommons.org/licenses/by-sa/4.0/?ref=chooser-v1)
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
