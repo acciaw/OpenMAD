@@ -42,7 +42,13 @@ UninstallDisplayIcon={app}\{#AppExe}
 ; file copy -- with /SUPPRESSMSGBOXES there would be no prompt to answer.
 ; RestartApplications is off because the [Run] entry below does the relaunch,
 ; and both would start a second copy.
-CloseApplications=yes
+; `force`, not `yes`. With `yes` Inno *asks* before closing an application that
+; holds one of its files -- and a silent run started by the in-app updater
+; cannot show that prompt, so with /SUPPRESSMSGBOXES it resolved to "cancel".
+; The log read "User canceled the installation process" followed by a rollback,
+; a second after starting, with nobody having cancelled anything. That was the
+; silent update failure. `force` closes the application instead of asking.
+CloseApplications=force
 RestartApplications=no
 
 [Files]
