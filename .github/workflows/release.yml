@@ -115,11 +115,18 @@ jobs:
         run: |
           $name    = "${{ needs.check.outputs.name }}"
           $version = "${{ needs.check.outputs.version }}"
-          $exe     = "dist\$name.exe"
+          $exe     = "dist\$name\$name.exe"
           $setup   = "packaging\Output\$name-Setup-$version.exe"
 
           if (-not (Test-Path $exe))   { throw "PyInstaller produced no $exe" }
           if (-not (Test-Path $setup)) { throw "Inno produced no $setup" }
+          # A one-folder build with no payload beside the exe would install and
+          # then fail to start, which is the failure this packaging change was
+          # made to end. Cheaper to catch here than in a release.
+          $dll = Get-ChildItem "dist\$name" -Recurse -Filter "python*.dll" |
+                 Select-Object -First 1
+          if (-not $dll) { throw "no python*.dll shipped beside $exe" }
+          Write-Output "payload ok: $($dll.FullName)"
           if ((Split-Path $setup -Leaf) -notmatch '^[\w.-]+-Setup-[\d.]+\.exe$') {
             throw "installer name is not one the updater will accept: $setup"
           }
