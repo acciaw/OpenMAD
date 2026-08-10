@@ -61,12 +61,14 @@ class BoardSpec:
 # official tool calls each board.
 BOARDS: tuple[BoardSpec, ...] = (
     # -- 60% family, 5x14 --------------------------------------------------
-    # 0x1053's matrix is confirmed: an owner's diagnostic report (protocol 9)
-    # read back 70 actuation/RT/colour entries and a calibration mask with 61
-    # switches in it, which is what the 60% layout in hud.py is now drawn from.
-    # Still unverified, because that report exercised no write path -- which is
-    # exactly the distinction `verified` exists to make.
-    BoardSpec(0x1053, "MAD60 HE",          5, 14, 4, 0x201F),
+    # 0x1053 is the second board confirmed on hardware, and the first 5x14 one.
+    # Two diagnostic reports from an owner, both on firmware protocol 9: the
+    # first read back 70 actuation/RT/colour entries and a calibration mask
+    # with 61 switches in it -- which is where the 60% layout in hud.py comes
+    # from -- and the second ran the write probe, which set key 0 to 1.50 mm,
+    # read 1.50 mm back and restored the original 1.00 mm. Read and write paths
+    # both exercised, so this is verified in the sense the flag means.
+    BoardSpec(0x1053, "MAD60 HE",          5, 14, 4, 0x201F, verified=True),
     BoardSpec(0x1054, "MAD60 HE RGB",      5, 14, 4, 0x2020),
     BoardSpec(0x1055, "MAD60 HE Ultra",    5, 14, 4, 0x2021),
     BoardSpec(0x1056, "MAD60 HE Limited",  5, 14, 4, 0x2022),

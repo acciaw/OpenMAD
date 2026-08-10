@@ -1,0 +1,151 @@
+# Build the executable and installer, then tag and publish a release.
+#
+# Triggered by a push to main. The version in version.ini is the switch: a push
+# whose version already has a tag builds nothing at all, so ordinary commits
+# cost seconds rather than minutes, and cutting a release is one line changed
+# in one file. That keeps version.ini the single source of truth it claims to
+# be -- the app, the installer, the update check and now the git tag all read
+# the same number, and none of them can be bumped without the others.
+#
+# The installer is attested (actions/attest-build-provenance), which ties the
+# binary to this repository, this commit and this workflow run. Anyone can
+# check a download before running it:
+#
+#     gh attestation verify OpenMAD-Setup-1.2.3.exe -R acciaw/OpenMAD
+#
+# That is the guarantee worth having for a file an auto-updater downloads and
+# executes unattended. Note that a tag created here is NOT signed -- see the
+# note at the release step.
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write        # create the tag and the release
+  id-token: write        # sign the provenance attestation
+  attestations: write    # record it
+
+# Two pushes in quick succession must not race to create the same tag.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Does this commit need a release?
+    runs-on: ubuntu-latest
+    outputs:
+      needed: ${{ steps.v.outputs.needed }}
+      name: ${{ steps.v.outputs.name }}
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # tags, so the "already released?" test can work
+
+      - id: v
+        name: Read version.ini and look for its tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          # configparser, not sed: the same parser mad68.spec and the app use,
+          # so this cannot disagree with them about what the version is.
+          python3 - >> "$GITHUB_OUTPUT" <<'PY'
+          import configparser
+          c = configparser.ConfigParser()
+          c.read("version.ini", encoding="utf-8")
+          print(f"name={c['app']['name']}")
+          print(f"version={c['app']['version']}")
+          print(f"tag=v{c['app']['version']}")
+          PY
+
+          tag="v$(python3 -c "import configparser;c=configparser.ConfigParser();c.read('version.ini',encoding='utf-8');print(c['app']['version'])")"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "$tag already exists - nothing to release."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$tag does not exist yet - building a release."
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build and publish ${{ needs.check.outputs.tag }}
+    needs: check
+    if: needs.check.outputs.needed == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build the executable
+        run: pyinstaller --noconfirm packaging/mad68.spec
+
+      - name: Install Inno Setup
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+          "ISCC=$iscc" >> $env:GITHUB_ENV
+
+      - name: Build the installer
+        run: '& "$env:ISCC" packaging\mad68.iss'
+
+      - name: Check the build is what the updater will accept
+        # The in-app updater only downloads an asset matching
+        # ^[\w.-]+-Setup-[\d.]+\.exe$ (updater._INSTALLER_RE) and refuses
+        # anything else. A release the updater silently will not install is
+        # worse than a failed build, so the name is checked here rather than
+        # discovered by users.
+        run: |
+          $name    = "${{ needs.check.outputs.name }}"
+          $version = "${{ needs.check.outputs.version }}"
+          $exe     = "dist\$name.exe"
+          $setup   = "packaging\Output\$name-Setup-$version.exe"
+
+          if (-not (Test-Path $exe))   { throw "PyInstaller produced no $exe" }
+          if (-not (Test-Path $setup)) { throw "Inno produced no $setup" }
+          if ((Split-Path $setup -Leaf) -notmatch '^[\w.-]+-Setup-[\d.]+\.exe$') {
+            throw "installer name is not one the updater will accept: $setup"
+          }
+
+          $mb = [math]::Round((Get-Item $setup).Length / 1MB, 1)
+          Write-Output "$setup  ($mb MB)"
+          "SETUP=$setup" >> $env:GITHUB_ENV
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ env.SETUP }}
+
+      - name: Tag and publish the release
+        # gh creates the tag as part of the release, pointed at this commit.
+        #
+        # That tag is a lightweight ref and carries no signature, so it will
+        # not show GitHub's "Verified" badge the way a locally signed
+        # `git tag -a` does. The attestation above is the stronger guarantee
+        # and covers the thing that actually matters -- the binary -- but if
+        # you want the badge as well, see the note in the repo README on
+        # switching this workflow to trigger on tag pushes instead.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ needs.check.outputs.tag }}" "$env:SETUP" `
+            --target "${{ github.sha }}" `
+            --title "${{ needs.check.outputs.name }} ${{ needs.check.outputs.version }}" `
+            --generate-notes
