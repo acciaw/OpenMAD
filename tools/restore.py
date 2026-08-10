@@ -51,7 +51,7 @@ from mad68.features import (  # noqa: E402
     KeyboardFeature,
     LightInfo,
 )
-from mad68.protocol import KEYMAP_SIZE, AdvancedKeyMode  # noqa: E402
+from mad68.protocol import AdvancedKeyMode  # noqa: E402
 
 UNCOVERED_NOTE = (
     "mix axle and tap dance -- read layout known, write layout unconfirmed. "
@@ -68,10 +68,14 @@ def plan(kb: Mad68, backup: dict) -> dict:
         "key_colors": None, "advanced_keys": [], "dks": [],
     }
 
+    # Against the connected board's own matrix, not the driver's default: a
+    # backup taken from a 60% is 560 bytes and restoring it to a 65% (or the
+    # reverse) would shift every row of bindings.
     want_keymap = bytes.fromhex(backup["keymap"]["hex"])
-    if len(want_keymap) != KEYMAP_SIZE:
+    if len(want_keymap) != kb.keymap_size:
         raise SystemExit(
-            f"backup keymap is {len(want_keymap)} bytes, expected {KEYMAP_SIZE}"
+            f"backup keymap is {len(want_keymap)} bytes, but the {kb.spec.name} "
+            f"expects {kb.keymap_size}; this backup is from a different board"
         )
     if kb.read_keymap() != want_keymap:
         changes["keymap"] = want_keymap

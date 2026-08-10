@@ -29,9 +29,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from mad68 import KeyboardValue, Mad68, Vendor  # noqa: E402
 from mad68.protocol import (  # noqa: E402
-    LAYER_COUNT,
-    MATRIX_COLS,
-    MATRIX_ROWS,
     VOLATILE_KEYBOARD_VALUES,
 )
 
@@ -183,10 +180,14 @@ def capture(kb: Mad68) -> dict:
             "macro_count": kb.macro_count(),
             "macro_buffer_size": macro_buffer_size,
         },
+        # The connected board's matrix, not the driver's default. A backup that
+        # recorded 5x15 for a 5x14 board would describe its own keymap wrongly,
+        # and restore.py checks the keymap length against it.
         "geometry": {
-            "layers": LAYER_COUNT,
-            "rows": MATRIX_ROWS,
-            "cols": MATRIX_COLS,
+            "board": kb.spec.name,
+            "layers": kb.spec.layers,
+            "rows": kb.matrix_rows,
+            "cols": kb.matrix_cols,
         },
         "keymap": {"size": len(keymap), "sha256": sha256(keymap), "hex": keymap.hex()},
         "macros": {"size": len(macros), "sha256": sha256(macros), "hex": macros.hex()},

@@ -86,13 +86,19 @@ def label(keycode: int) -> str:
     return f"{keycode:#06x}"
 
 
-def decode_keymap(keymap: bytes, layer: int) -> list[list[int]]:
-    """Split a raw keymap buffer into rows of 16-bit keycodes for one layer."""
+def decode_keymap(keymap: bytes, layer: int, rows: int = MATRIX_ROWS,
+                  cols: int = MATRIX_COLS) -> list[list[int]]:
+    """Split a raw keymap buffer into rows of 16-bit keycodes for one layer.
+
+    The row stride is the board's own column count, so callers holding a device
+    must pass kb.matrix_rows / kb.matrix_cols. Reading a 14-column board's
+    buffer with a stride of 15 shifts every row after the first.
+    """
     out = []
-    for row in range(MATRIX_ROWS):
+    for row in range(rows):
         cells = []
-        for col in range(MATRIX_COLS):
-            off = ((layer * MATRIX_ROWS + row) * MATRIX_COLS + col) * 2
+        for col in range(cols):
+            off = ((layer * rows + row) * cols + col) * 2
             cells.append(int.from_bytes(keymap[off:off + 2], "big"))
         out.append(cells)
     return out
@@ -100,11 +106,12 @@ def decode_keymap(keymap: bytes, layer: int) -> list[list[int]]:
 
 def render_matrix(keymap: bytes, layer: int = 0, *,
                   annotate: dict[tuple[int, int], str] | None = None,
-                  width: int = 8) -> str:
+                  width: int = 8, rows: int = MATRIX_ROWS,
+                  cols: int = MATRIX_COLS) -> str:
     """A text grid of one layer, optionally annotating specific positions."""
-    rows = decode_keymap(keymap, layer)
-    lines = ["      " + "".join(f"{c:>{width}}" for c in range(MATRIX_COLS))]
-    for r, cells in enumerate(rows):
+    grid = decode_keymap(keymap, layer, rows, cols)
+    lines = ["      " + "".join(f"{c:>{width}}" for c in range(cols))]
+    for r, cells in enumerate(grid):
         rendered = []
         for c, kc in enumerate(cells):
             text = label(kc)
