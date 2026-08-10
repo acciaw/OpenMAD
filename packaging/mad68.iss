@@ -52,10 +52,15 @@ CloseApplications=force
 RestartApplications=no
 
 [Files]
-Source: "..\dist\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\version.ini";     DestDir: "{app}"; Flags: ignoreversion
-
-[Files]
+; The whole one-folder build: OpenMAD.exe and the _internal folder beside it.
+; PyInstaller produces a directory rather than a single file on purpose -- see
+; the note at the top of mad68.spec -- so this copies the tree, not one file.
+Source: "..\dist\{#AppName}\*"; DestDir: "{app}"; \
+    Flags: ignoreversion recursesubdirs createallsubdirs
+; version.ini is bundled inside _internal too, but the app looks beside the
+; executable first (mad68.version._locate) so that the number tracks the
+; release being installed rather than whenever the exe happened to be built.
+Source: "..\version.ini"; DestDir: "{app}"; Flags: ignoreversion
 ; Branding, if it has been supplied. `skipifsourcedoesntexist` keeps the build
 ; working before the artwork exists.
 Source: "..\assets\logo.png"; DestDir: "{app}\assets"; Flags: ignoreversion skipifsourcedoesntexist
@@ -88,8 +93,14 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "Start {#AppName}"; Flags: nowait postinstall skipifsilent
-; The interactive entry above is a tick-box on the final wizard page, which a
-; silent run never shows -- that is what `skipifsilent` means. An in-app update
-; is exactly a silent run, so without this line the app would close to install
-; and never come back. WizardSilent covers /SILENT and /VERYSILENT alike.
-Filename: "{app}\{#AppExe}"; Flags: nowait; Check: WizardSilent
+; Only the interactive entry above lives here: a tick-box on the final wizard
+; page, which a silent run never shows -- that is what `skipifsilent` means.
+;
+; A silent run is what the in-app updater does, and it deliberately gets no
+; [Run] entry. There used to be one (`Flags: nowait; Check: WizardSilent`) and
+; it started the new build six milliseconds after this installer finished
+; writing it, which was too soon: the PyInstaller onefile bootloader failed
+; part-way through unpacking itself and died with "Failed to load Python DLL
+; ... python313.dll". The updater now restarts the app itself, once this
+; installer has fully exited and after a pause -- see _RESTART_SETTLE_S in
+; src/mad68/updater.py.

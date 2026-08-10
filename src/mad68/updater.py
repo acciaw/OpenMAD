@@ -101,6 +101,30 @@ _LAUNCHER_MAX_TRIES = 120
 # cover process creation.
 _LAUNCH_CONFIRM_S = 5.0
 
+# Pause between the installer finishing and the new build being started.
+#
+# The relaunch used to be Inno's job, an `[Run] ... Check: WizardSilent` entry
+# in packaging/mad68.iss. Inno logged
+#
+#     17:29:52.874  Installation process succeeded.
+#     17:29:52.880  -- Run entry --  Type: Exec
+#     17:29:53.440  Log closed.
+#
+# so the new executable was started six milliseconds after a 19 MB file
+# finished being written, by a process that then exited half a second later.
+# The PyInstaller onefile bootloader unpacks that archive into %TEMP%\_MEInnnn
+# before it can run, and it did not get there: it failed with "Failed to load
+# Python DLL ... python313.dll. LoadLibrary: The specified module could not be
+# found", i.e. its own extraction was incomplete. Starting the same executable
+# by hand a few seconds later worked every time, and %TEMP% still holds an
+# orphaned _MEI directory with 20 of the 63 files in it from an earlier
+# occurrence.
+#
+# So the relaunch happens here instead, after the installer has fully exited
+# and after a pause, which is the one variable that distinguished the failing
+# launch from the working one.
+_RESTART_SETTLE_S = 4
+
 # `ping` rather than `timeout`, which needs a console this deliberately lacks.
 # `tasklist | find` is a pipe between two console programs, which is why the
 # launch below uses CREATE_NO_WINDOW (a console, just not a visible one) and
@@ -110,6 +134,7 @@ _LAUNCHER_CMD = (
     "@echo off\r\n"
     "rem OpenMAD update launcher, written by the app. Safe to delete.\r\n"
     "rem %1 installer  %2 installer log  %3 PID to wait for  %4 max tries\r\n"
+    "rem %5 app to restart afterwards, or \"\" not to\r\n"
     'echo [%DATE% %TIME%] waiting for PID %~3 > "%~dp0launcher.log"\r\n'
     "set TRIES=0\r\n"
     ":wait\r\n"
@@ -125,6 +150,12 @@ _LAUNCHER_CMD = (
     "%1 /SILENT /SUPPRESSMSGBOXES /NORESTART /LOG=%2\r\n"
     'echo [%DATE% %TIME%] installer exit code %ERRORLEVEL%'
     ' >> "%~dp0launcher.log"\r\n'
+    'if "%~5"=="" goto done\r\n'
+    f"ping -n {_RESTART_SETTLE_S + 1} 127.0.0.1 >nul\r\n"
+    'echo [%DATE% %TIME%] restarting %~5 >> "%~dp0launcher.log"\r\n'
+    "start \"\" %5\r\n"
+    'echo [%DATE% %TIME%] restart issued >> "%~dp0launcher.log"\r\n'
+    ":done\r\n"
 )
 
 
@@ -323,8 +354,15 @@ class Updater:
         # See _LAUNCHER_CMD for why this is a script file taking arguments and
         # not a command string, and why CREATE_NO_WINDOW rather than
         # DETACHED_PROCESS. The launcher outlives this process on purpose.
+        # What to start when the install finishes. sys.executable is this very
+        # OpenMAD.exe, which the installer overwrites in place, so it is the
+        # right path by construction rather than a guess at the install
+        # directory. Empty from a source checkout, where there is nothing an
+        # installer would have replaced.
+        restart = sys.executable if getattr(sys, "frozen", False) else ""
+
         argv = [str(launcher), str(installer), str(log),
-                str(os.getpid()), str(_LAUNCHER_MAX_TRIES)]
+                str(os.getpid()), str(_LAUNCHER_MAX_TRIES), restart]
         try:
             subprocess.Popen(
                 argv,
