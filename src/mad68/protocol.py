@@ -265,13 +265,36 @@ DANGEROUS_VENDOR = frozenset(
 
 
 # Geometry
-
+#
+# These are DEFAULTS, not facts about the connected keyboard. The controller is
+# shared across boards whose matrices are 5x15, 5x14 and 5x6 (see devices.py),
+# and every buffer on the wire -- the keymap, the actuation array, the per-key
+# colour table -- is packed row-major over the *board's own* column count. A
+# 60% board packs 14 keys per row, so reading its keymap with a stride of 15
+# lands one key further left on every row after the first.
+#
+# So anything holding a live Mad68 must take its geometry from `kb.spec`
+# (kb.matrix_rows / kb.matrix_cols / kb.total_keys / kb.keymap_size) rather
+# than from these names. They exist for code with no device in hand, and are
+# the 5x15 board this driver was developed against.
 LAYER_COUNT = 4
 MATRIX_ROWS = 5
 MATRIX_COLS = 15
 KEYCODE_SIZE = 2  # keyClass, keyId, a 16-bit QMK keycode, big-endian
 KEYMAP_SIZE = LAYER_COUNT * MATRIX_ROWS * MATRIX_COLS * KEYCODE_SIZE  # 600
 TOTAL_KEYS = MATRIX_ROWS * MATRIX_COLS  # 75
+
+
+def keymap_size(rows: int = MATRIX_ROWS, cols: int = MATRIX_COLS,
+                layers: int = LAYER_COUNT) -> int:
+    """Bytes in the dynamic keymap buffer for a given matrix."""
+    return layers * rows * cols * KEYCODE_SIZE
+
+
+def keymap_offset(layer: int, row: int, col: int, rows: int = MATRIX_ROWS,
+                  cols: int = MATRIX_COLS) -> int:
+    """Byte offset of one keycode inside a dynamic keymap buffer."""
+    return ((layer * rows + row) * cols + col) * KEYCODE_SIZE
 
 # Byte order the LEDs expect. Addressable LEDs are commonly GRB rather than
 # RGB, and the firmware passes our bytes through untouched, the value read

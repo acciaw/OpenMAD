@@ -35,6 +35,7 @@ from .profile import (
     Profile,
     default_profile,
     ensure_default_profile,
+    fit_key_colors,
 )
 from .settings import AppSettings, get_start_at_login, set_start_at_login
 from .version import APP_NAME, APP_VERSION, GITHUB_REPO, PROJECT_URL
@@ -75,6 +76,11 @@ ONBOARD_STATE = "onboard.json"
 
 def _onboard_path(profile_dir: Path) -> Path:
     return Path(profile_dir).parent / ONBOARD_STATE
+
+
+def _fit_colors(sampler, stored) -> list[list[int]]:
+    """A profile's key colours, laid out for the board currently connected."""
+    return fit_key_colors(stored or [], sampler.rows, sampler.cols)
 
 
 def read_onboard(profile_dir: Path) -> dict:
@@ -154,6 +160,13 @@ class Sampler:
         self.observed_range: list[int] = []
         self.active_profile: str | None = None
 
+        # The connected board's matrix, refreshed on every (re)connect by
+        # _init_static. Defaults are the driver's development board, used only
+        # before anything has answered.
+        self.rows = MATRIX_ROWS
+        self.cols = MATRIX_COLS
+        self.total_keys = TOTAL_KEYS
+
         # When the UI is editing one key, that key is sampled on its own between
         # full sweeps. A full 75-key sweep is ~6 ms, which caps the refresh at
         # roughly 20 Hz, too coarse for a travel gauge you watch while pressing.
@@ -211,11 +224,23 @@ class Sampler:
     # sampling
 
     def _init_static(self, kb: Mad68) -> None:
+        # Geometry comes from the board, and is cached so the HTTP handlers --
+        # which run off the device thread and often have no kb in hand -- size
+        # per-key arrays for the keyboard that is actually plugged in.
+        #
+        # The sensor baseline is indexed by key, so a reconnect that lands on a
+        # board of a different size has to drop it rather than index a 75-entry
+        # array with a 70-key sweep (or, worse, a 70-entry one with 75).
+        if kb.total_keys != self.total_keys:
+            self.baseline = []
+            self.observed_range = []
+        self.rows, self.cols = kb.matrix_rows, kb.matrix_cols
+        self.total_keys = kb.total_keys
         keymap = kb.read_keymap()
         self.names = []
-        for r in range(MATRIX_ROWS):
-            for c in range(MATRIX_COLS):
-                off = (r * MATRIX_COLS + c) * 2
+        for r in range(self.rows):
+            for c in range(self.cols):
+                off = (r * self.cols + c) * 2
                 self.names.append(label(int.from_bytes(keymap[off:off + 2], "big")))
         self.calibration = kb.read_calibration_status()
 
@@ -293,12 +318,13 @@ class Sampler:
             trip = kb.read_trip_raw()
             sweep_ms = (time.monotonic() - t0) * 1000
 
+            total = kb.total_keys
             if not self.baseline:
                 self.baseline = list(adc)
-                self.observed_range = [ASSUMED_RANGE] * TOTAL_KEYS
+                self.observed_range = [ASSUMED_RANGE] * total
 
             keys = []
-            for i in range(TOTAL_KEYS):
+            for i in range(total):
                 delta = adc[i] - self.baseline[i]
                 mag = abs(delta)
                 if mag > self.observed_range[i]:
@@ -319,10 +345,11 @@ class Sampler:
                     travel_mm = 0.0
                     source = "rest"
 
+                row, col = kb.key_rowcol(i)
                 keys.append({
                     "i": i,
-                    "row": i // MATRIX_COLS,
-                    "col": i % MATRIX_COLS,
+                    "row": row,
+                    "col": col,
                     "name": self.names[i] if i < len(self.names) else "?",
                     "adc": adc[i],
                     "rest": self.baseline[i],
@@ -346,7 +373,7 @@ class Sampler:
                 self._snapshot = Snapshot(
                     keys=keys,
                     calibrated=sum(1 for v in self.calibration if v),
-                    total=TOTAL_KEYS,
+                    total=total,
                     sample_hz=hz,
                     samples=count,
                     active_profile=self.active_profile,
@@ -368,13 +395,14 @@ class Sampler:
 def read_full_config(kb: Mad68) -> dict:
     """Everything the settings tabs need, in one device-thread pass."""
     keymap = kb.read_keymap()
+    rows, cols = kb.matrix_rows, kb.matrix_cols
     layers = []
-    for layer in range(4):
+    for layer in range(kb.spec.layers):
         row_out = []
-        for r in range(MATRIX_ROWS):
+        for r in range(rows):
             cells = []
-            for c in range(MATRIX_COLS):
-                off = ((layer * MATRIX_ROWS + r) * MATRIX_COLS + c) * 2
+            for c in range(cols):
+                off = ((layer * rows + r) * cols + c) * 2
                 kc = int.from_bytes(keymap[off:off + 2], "big")
                 cells.append({"kc": kc, "name": label(kc)})
             row_out.append(cells)
@@ -465,6 +493,12 @@ def read_full_config(kb: Mad68) -> dict:
         "total_keys": spec.total_keys,
         "form_factor": spec.form_factor,
         "board_verified": spec.verified,
+        # Which matrix slots actually carry a switch, straight from the
+        # firmware's own calibration flags. The drawn layout is a table in the
+        # UI and can be wrong for a board nobody here owns; this cannot be, so
+        # the UI falls back to it when the two disagree rather than drawing keys
+        # over dead slots.
+        "populated": safe(lambda: [bool(b) for b in kb.populated_mask()], []),
         # Mirrors the gate in Mad68._check exactly: confirmed firmware AND a
         # confirmed model, unless the user has unlocked this board by hand.
         "writes_allowed": bool(
@@ -1231,7 +1265,7 @@ def make_handler(sampler: Sampler):
                         kb.write_light_info(LightInfo(
                             effect=PER_KEY_EFFECT, speed=0, r=rgb[0], g=rgb[1],
                             b=rgb[2], brightness=bright))
-                        kb.write_all_key_colors([rgb] * TOTAL_KEYS)
+                        kb.write_all_key_colors([rgb] * kb.total_keys)
                         return True
 
                     s.submit(paint, timeout=30)
@@ -1260,7 +1294,8 @@ def make_handler(sampler: Sampler):
                 mm = float(d["mm"])
                 if d.get("all"):
                     return s.submit(
-                        lambda kb: {"packets": kb.write_actuation_bulk([mm] * TOTAL_KEYS)}
+                        lambda kb: {"packets": kb.write_actuation_bulk(
+                            [mm] * kb.total_keys)}
                     )
                 row, col = int(d["row"]), int(d["col"])
                 return s.submit(lambda kb: kb.write_actuation_mm(row, col, mm))
@@ -1297,7 +1332,8 @@ def make_handler(sampler: Sampler):
                 if d.get("all"):
                     rgb = (int(d["r"]), int(d["g"]), int(d["b"]))
                     return s.submit(
-                        lambda kb: {"packets": kb.write_all_key_colors([rgb] * TOTAL_KEYS)}
+                        lambda kb: {"packets": kb.write_all_key_colors(
+                            [rgb] * kb.total_keys)}
                     )
                 row, col = int(d["row"]), int(d["col"])
                 rgb = (int(d["r"]), int(d["g"]), int(d["b"]))
@@ -1450,7 +1486,11 @@ def make_handler(sampler: Sampler):
                                 "press_mm": float(item["press_mm"]),
                                 "release_mm": float(item["release_mm"])}
                     elif key == "key_colors_keys":
-                        colors = doc.get("key_colors") or [[0, 0, 0]] * TOTAL_KEYS
+                        # The UI sends indices in the connected board's linear
+                        # key order, so the stored array has to be in the same
+                        # order before it is indexed -- a profile captured on a
+                        # wider board is not.
+                        colors = _fit_colors(s, doc.get("key_colors"))
                         for item in value:
                             colors[int(item["index"])] = [int(item["r"]), int(item["g"]),
                                                           int(item["b"])]
@@ -1482,13 +1522,14 @@ def make_handler(sampler: Sampler):
                             "release_mm": float(value["release_mm"])}
                         doc["rapid_trigger"]["overrides"] = {}
                     elif key == "key_color":
-                        colors = doc.get("key_colors") or [[0, 0, 0]] * TOTAL_KEYS
+                        colors = _fit_colors(s, doc.get("key_colors"))
                         colors[int(value["index"])] = [int(value["r"]), int(value["g"]),
                                                        int(value["b"])]
                         doc["key_colors"] = colors
                     elif key == "key_colors_all":
                         doc["key_colors"] = [[int(value["r"]), int(value["g"]),
-                                              int(value["b"])] for _ in range(TOTAL_KEYS)]
+                                              int(value["b"])]
+                                             for _ in range(s.total_keys)]
                     elif key in ("light", "performance"):
                         doc.setdefault(key, {})
                         doc[key].update({k2: v2 for k2, v2 in value.items()})
@@ -2288,11 +2329,16 @@ BOARD_CSS = r"""
 .kcap.perf .lbl { font-size: 10.5px; }
 """
 
-# The physical 65 percent layout, as [row, col, width in units]. Shared so the
-# home page and the configurator draw the same keyboard rather than two
-# different approximations of it.
+# The physical layouts, as [row, col, width in units], one table per column
+# count. Defined once and used by both pages: the home page's decorative board
+# and the configurator's editable one drew the same keyboard from two separate
+# copies of this table, which is exactly how the 60% copy came to be wrong in
+# one of them and right in neither.
+#
+# The provenance of each table, and the calibration mask that settles the 60%,
+# are documented at the configurator's use of them further down.
 BOARD_JS = r"""
-const LAYOUT=[
+const LAYOUT_65=[
  [[0,0,1],[0,1,1],[0,2,1],[0,3,1],[0,4,1],[0,5,1],[0,6,1],[0,7,1],[0,8,1],[0,9,1],
   [0,10,1],[0,11,1],[0,12,1],[0,13,2],[0,14,1]],
  [[1,0,1.5],[1,1,1],[1,2,1],[1,3,1],[1,4,1],[1,5,1],[1,6,1],[1,7,1],[1,8,1],[1,9,1],
@@ -2304,7 +2350,32 @@ const LAYOUT=[
  [[4,0,1.25],[4,1,1.25],[4,2,1.25],[4,6,6.25],[4,9,1],[4,10,1],[4,11,1],[4,12,1],
   [4,13,1],[4,14,1]],
 ];
-const LEGEND_STATIC={
+const LAYOUT_60=[
+ [[0,0,1],[0,1,1],[0,2,1],[0,3,1],[0,4,1],[0,5,1],[0,6,1],[0,7,1],[0,8,1],[0,9,1],
+  [0,10,1],[0,11,1],[0,12,1],[0,13,2]],
+ [[1,0,1.5],[1,1,1],[1,2,1],[1,3,1],[1,4,1],[1,5,1],[1,6,1],[1,7,1],[1,8,1],[1,9,1],
+  [1,10,1],[1,11,1],[1,12,1],[1,13,1.5]],
+ [[2,0,1.75],[2,1,1],[2,2,1],[2,3,1],[2,4,1],[2,5,1],[2,6,1],[2,7,1],[2,8,1],[2,9,1],
+  [2,10,1],[2,11,1],[2,13,2.25]],
+ [[3,0,2.25],[3,2,1],[3,3,1],[3,4,1],[3,5,1],[3,6,1],[3,7,1],[3,8,1],[3,9,1],[3,10,1],
+  [3,11,1],[3,13,2.75]],
+ [[4,0,1.25],[4,1,1.25],[4,2,1.25],[4,6,6.25],[4,10,1.25],[4,11,1.25],[4,12,1.25],
+  [4,13,1.25]],
+];
+/* Anything else on this controller is a macropad; a plain grid is the honest
+   default for a board whose physical arrangement nobody here has seen. */
+function gridLayout(cols){
+  const out=[];
+  for(let r=0;r<5;r++){const row=[];for(let c=0;c<cols;c++)row.push([r,c,1]);out.push(row);}
+  return out;
+}
+function layoutFor(cols){
+  return cols===15?LAYOUT_65:cols===14?LAYOUT_60:gridLayout(cols||15);
+}
+/* Fallback cap legends, used only where there is no keymap to read from -- the
+   home page. Keyed by column count, since the right-hand columns of a 60% and a
+   65% carry different keys. */
+const LEGEND_STATIC_65={
  "0,0":"Esc","0,13":"Backspace","0,14":"Del",
  "1,0":"Tab","1,13":"\\","1,14":"PgUp",
  "2,0":"Caps","2,13":"Enter","2,14":"PgDn",
@@ -2312,10 +2383,19 @@ const LEGEND_STATIC={
  "4,0":"Ctrl","4,1":"Win","4,2":"Alt","4,6":"","4,9":"Alt","4,10":"Fn",
  "4,11":"Ctrl","4,12":"←","4,13":"↓","4,14":"→",
 };
+const LEGEND_STATIC_60={
+ "0,0":"Esc","0,13":"Backspace",
+ "1,0":"Tab","1,13":"\\",
+ "2,0":"Caps","2,13":"Enter",
+ "3,0":"Shift","3,13":"Shift",
+ "4,0":"Ctrl","4,1":"Win","4,2":"Alt","4,6":"","4,10":"Alt","4,11":"Fn",
+ "4,12":"Menu","4,13":"Ctrl",
+};
 const ROW1="1234567890-=", ROW2="QWERTYUIOP[]", ROW3="ASDFGHJKL;'", ROW4="ZXCVBNM,./";
-function staticLegend(r,c){
+function staticLegend(r,c,cols){
+  const table=cols===14?LEGEND_STATIC_60:LEGEND_STATIC_65;
   const k=`${r},${c}`;
-  if(k in LEGEND_STATIC)return LEGEND_STATIC[k];
+  if(k in table)return table[k];
   if(r===0&&c>=1&&c<=12)return ROW1[c-1]||"";
   if(r===1&&c>=1&&c<=12)return ROW2[c-1]||"";
   if(r===2&&c>=1&&c<=11)return ROW3[c-1]||"";
@@ -2323,11 +2403,12 @@ function staticLegend(r,c){
   return "";
 }
 /* A non-interactive board, same markup and metrics as the configurator's. */
-function staticBoardHTML(){
-  const rows=LAYOUT.map(row=>{
+function staticBoardHTML(cols){
+  cols=+cols||15;
+  const rows=layoutFor(cols).map(row=>{
     const caps=row.map(([r,c,w])=>
       `<div class="kcap" style="width:calc(var(--u) * ${w} - 5px)"
-        ><span class="lbl">${staticLegend(r,c)}</span></div>`).join("");
+        ><span class="lbl">${staticLegend(r,c,cols)}</span></div>`).join("");
     return `<div class="krow">${caps}</div>`;
   }).join("");
   return `<div class="board">${rows}
@@ -2479,7 +2560,17 @@ dd { margin: 0; font-variant-numeric: tabular-nums; }
 <div id="toast"></div>
 <script>
 """ + BOARD_JS + r"""
-document.getElementById("board").innerHTML = staticBoardHTML();
+/* Drawn once at the default geometry so the page is never empty, then redrawn
+   for the board that actually answered. A 60% owner was otherwise shown a 65%
+   here regardless of what was plugged in. */
+let boardCols = 0;
+function drawBoard(cols) {
+  cols = +cols || 15;
+  if (cols === boardCols) return;
+  boardCols = cols;
+  document.getElementById("board").innerHTML = staticBoardHTML(cols);
+}
+drawBoard(15);
 function toast(msg, bad) {
   const t = document.createElement("div");
   t.className = "toast" + (bad ? " bad" : ""); t.textContent = msg;
@@ -2505,6 +2596,7 @@ async function check() {
               + "read-only until it is. See Other Settings to help verify it."
             : "This board is not in the supported list. It shares the vendor's "
               + "config interface, so it opens read-only.");
+      if (d.cols) drawBoard(d.cols);
       const geo = d.rows && d.cols
         ? `${d.rows} × ${d.cols} (${d.total_keys} keys)` : "-";
       info.innerHTML =
@@ -2906,7 +2998,7 @@ main { min-width: 0; }
 <div class="ctxmenu" id="ctxmenu"></div>
 
 <script>
-""" + RAMP_JS + r"""
+""" + RAMP_JS + BOARD_JS + r"""
 const $ = s => document.querySelector(s);
 let latest=null, config=null, profiles=[], editing=null, editDoc=null;
 let sel=new Set(), layer=0, tab="Change Key Setting", subtab="Travel";
@@ -2963,57 +3055,65 @@ let view="equipment";
    r2c12, LShift absorbs r3c1, and Space absorbs r4 c3-c5 and c7-c8, which is
    why those matrix slots read as empty.
 
-   60% (14 cols) follows the same conventions with the right-hand nav column
-   removed and RShift widened to take up the slack. It is a reasoned layout
-   rather than a measured one: the matrix geometry is the vendor's, but which
-   physical key sits on which slot has not been confirmed on hardware. Keys may
-   be drawn in the wrong place on a 60% board even though every value read from
-   it is correct. A diagnostic report from one owner fixes it for good.
+   60% (14 cols) is now measured too, from a MAD60 HE owner's diagnostic report
+   (firmware protocol 9). Its calibration mask -- the firmware's own record of
+   which slots carry a switch -- reads
 
-   The 6-column board is a macropad; a plain grid is the honest default. */
-const LAYOUT_65=[
- [[0,0,1],[0,1,1],[0,2,1],[0,3,1],[0,4,1],[0,5,1],[0,6,1],[0,7,1],[0,8,1],[0,9,1],
-  [0,10,1],[0,11,1],[0,12,1],[0,13,2],[0,14,1]],
- [[1,0,1.5],[1,1,1],[1,2,1],[1,3,1],[1,4,1],[1,5,1],[1,6,1],[1,7,1],[1,8,1],[1,9,1],
-  [1,10,1],[1,11,1],[1,12,1],[1,13,1.5],[1,14,1]],
- [[2,0,1.75],[2,1,1],[2,2,1],[2,3,1],[2,4,1],[2,5,1],[2,6,1],[2,7,1],[2,8,1],[2,9,1],
-  [2,10,1],[2,11,1],[2,13,2.25],[2,14,1]],
- [[3,0,2.25],[3,2,1],[3,3,1],[3,4,1],[3,5,1],[3,6,1],[3,7,1],[3,8,1],[3,9,1],[3,10,1],
-  [3,11,1],[3,12,1.75],[3,13,1],[3,14,1]],
- [[4,0,1.25],[4,1,1.25],[4,2,1.25],[4,6,6.25],[4,9,1],[4,10,1],[4,11,1],[4,12,1],
-  [4,13,1],[4,14,1]],
-];
-const LAYOUT_60=[
- [[0,0,1],[0,1,1],[0,2,1],[0,3,1],[0,4,1],[0,5,1],[0,6,1],[0,7,1],[0,8,1],[0,9,1],
-  [0,10,1],[0,11,1],[0,12,1],[0,13,2]],
- [[1,0,1.5],[1,1,1],[1,2,1],[1,3,1],[1,4,1],[1,5,1],[1,6,1],[1,7,1],[1,8,1],[1,9,1],
-  [1,10,1],[1,11,1],[1,12,1],[1,13,1.5]],
- [[2,0,1.75],[2,1,1],[2,2,1],[2,3,1],[2,4,1],[2,5,1],[2,6,1],[2,7,1],[2,8,1],[2,9,1],
-  [2,10,1],[2,11,1],[2,13,2.25]],
- [[3,0,2.25],[3,2,1],[3,3,1],[3,4,1],[3,5,1],[3,6,1],[3,7,1],[3,8,1],[3,9,1],[3,10,1],
-  [3,11,1],[3,12,2.75]],
- [[4,0,1.25],[4,1,1.25],[4,2,1.25],[4,6,6.25],[4,9,1.25],[4,10,1.25],[4,11,1.25],
-  [4,12,1.25]],
-];
-function gridLayout(cols){
-  const out=[];
-  for(let r=0;r<5;r++){const row=[];for(let c=0;c<cols;c++)row.push([r,c,1]);out.push(row);}
-  return out;
-}
-/* Columns of the connected board. Updated from /api/config once it arrives;
-   15 until then, because that is the only geometry confirmed on hardware. */
+     r0 11111111111111   r1 11111111111111   r2 11111111111101
+     r3 10111111111101   r4 11100010001111
+
+   which is 61 keys, an ANSI 60%. Two slots differ from what was guessed here
+   before: RShift is r3c13, not r3c12, and the bottom-right cluster is c10-c13,
+   not c9-c12. Guessing them cost the four bottom-right keys and RShift: they
+   were drawn over empty matrix slots, so they showed no colour, no travel and
+   edited nothing, while the five real keys behind them were unreachable.
+
+   The 6-column board is a macropad; a plain grid is the honest default.
+
+   LAYOUT_65, LAYOUT_60, gridLayout and layoutFor come from BOARD_JS, included
+   above, so the home page's board and this one cannot drift apart. */
+
+/* Columns of the connected board, and which of its slots carry a switch.
+   Both come from /api/config once it arrives; the 65% is the default until
+   then, because that is the geometry this driver was developed against. */
 let COLS=15;
 let LAYOUT=LAYOUT_65;
-function setGeometry(cols){
+let POPULATED=null;   /* device calibration mask, or null if it did not answer */
+let LAYOUT_GUESSED=false;
+
+/* The drawn layout is a table above; the calibration mask is the firmware's own
+   record of where the switches are. When they disagree the mask wins, because
+   a layout that draws a cap over an empty slot produces exactly the symptoms a
+   board report gets filed for: a key with no colour, no travel and no effect
+   when you edit it, and a real key next to it that nothing can select.
+
+   Falling back to a plain grid is uglier than a shaped board and always right.
+   It also makes the disagreement visible rather than silent, so an unverified
+   board reports itself instead of looking subtly broken. */
+function layoutFits(layout,mask,cols){
+  if(!mask||!mask.length)return true;
+  return layout.flat().every(([r,c])=>mask[r*cols+c]);
+}
+function setGeometry(cols,mask){
   cols=+cols||15;
-  if(cols===COLS)return false;
+  const next=Array.isArray(mask)&&mask.length?mask:null;
+  const same=cols===COLS&&JSON.stringify(next)===JSON.stringify(POPULATED);
+  if(same)return false;
   COLS=cols;
-  LAYOUT = cols===15 ? LAYOUT_65 : cols===14 ? LAYOUT_60 : gridLayout(cols);
+  POPULATED=next;
+  const table = (cols===15||cols===14) ? layoutFor(cols) : null;
+  LAYOUT_GUESSED = !!table && !layoutFits(table,POPULATED,cols);
+  LAYOUT = (table && !LAYOUT_GUESSED) ? table : gridLayout(cols);
   return true;
 }
 /* Matrix index is row-major over the board's own column count, so this has to
    follow the connected board rather than assume 15. */
 const idx=(r,c)=>r*COLS+c;
+/* ...and so does the inverse. Every "which key is index i" in this page goes
+   through these two, so there is one place a column count can be wrong. */
+const rc=i=>[Math.floor(i/COLS), i%COLS];
+const rcKey=i=>{const[r,c]=rc(i);return `${r},${c}`;};
+const isPopulated=i=>POPULATED?!!POPULATED[i]:true;
 
 /* keycode names, mirroring src/mad68/keycodes.py */
 const KC={};
@@ -3172,7 +3272,7 @@ async function loadConfig(){try{config=await(await fetch("/api/config")).json();
   catch(e){toast("could not read the keyboard",true);}
   // The board reports its own matrix, so the drawing follows the hardware
   // rather than the geometry this driver happened to be written against.
-  if(config&&config.cols)setGeometry(config.cols);
+  if(config&&config.cols)setGeometry(config.cols,config.populated);
   drawVersionBanner();}
 /* Key bindings live on the keyboard, not in a profile, and switching profiles
    deliberately does not rewrite them. This says which profiles currently share
@@ -3239,19 +3339,30 @@ async function drawKeymapNote(){
 function drawVersionBanner(){
   const el=$("#verbanner");
   if(!el)return;
+  const notes=[];
   // config.protocol_version_known is false only when the keyboard's own
   // reported protocol version differs from the one this driver was verified
   // against. That means firmware changed, not that anything here is broken --
   // but every packet layout in the app was reverse engineered from one
   // specific firmware, so it is worth saying plainly rather than silently
   // hoping nothing moved.
-  if(!config||config.protocol_version_known!==false){el.innerHTML="";return;}
-  el.innerHTML=`<span>&#9888;</span>
-    <span>This keyboard reports protocol version <b>${config.protocol_version}</b>,
-      different from the version this driver was built and tested against.
-      A firmware update likely changed the keyboard's data format, so settings
-      here may read or apply incorrectly. Back up first, and consider using
-      the official configurator until this is confirmed to work.</span>`;
+  if(config&&config.protocol_version_known===false)notes.push(
+    `This keyboard reports protocol version <b>${config.protocol_version}</b>,
+     different from the version this driver was built and tested against.
+     A firmware update likely changed the keyboard's data format, so settings
+     here may read or apply incorrectly. Back up first, and consider using
+     the official configurator until this is confirmed to work.`);
+  // The drawn layout disagreed with the firmware's own calibration mask, so
+  // the board is being shown as a plain grid instead. Every key still reads
+  // and writes correctly -- only the shape is unknown -- and saying so is what
+  // turns "the app looks wrong" into a report that can fix it.
+  if(LAYOUT_GUESSED)notes.push(
+    `This board's physical key arrangement is not known here, so its keys are
+     shown as a plain <b>${config&&config.rows||5} &times; ${COLS}</b> grid
+     rather than in their real shape. Every setting still applies to the right
+     key. Sending a board report from Other Settings is what fixes the shape.`);
+  if(!notes.length){el.innerHTML="";return;}
+  el.innerHTML=notes.map(n=>`<span>&#9888;</span><span>${n}</span>`).join("");
 }
 async function refreshProfiles(){try{
   profiles=(await(await fetch("/api/profiles")).json()).profiles||[];}catch(e){}
@@ -3261,7 +3372,16 @@ async function refreshProfiles(){try{
     .default_profile)||"";}catch(e){}}
 
 /* ---- selection helpers ------------------------------------------------- */
-const populated=()=>LAYOUT.flat().map(([r,c])=>idx(r,c));
+/* Every key that physically exists, not every key that happens to be drawn.
+   "Select all" then reaches the whole board even if the layout table is short,
+   and never selects a dead matrix slot whose write goes nowhere. */
+const populated=()=>{
+  const drawn=LAYOUT.flat().map(([r,c])=>idx(r,c));
+  if(!POPULATED)return drawn;
+  const real=[];
+  for(let i=0;i<POPULATED.length;i++)if(POPULATED[i])real.push(i);
+  return real.length?real:drawn;
+};
 function selectAll(){sel=new Set(populated());draw();}
 function selectNone(){sel=new Set();draw();}
 function selectInvert(){const all=populated();
@@ -3276,7 +3396,7 @@ const LEGEND={0x1e:"!1",0x1f:"@2",0x20:"#3",0x21:"$4",0x22:"%5",0x23:"^6",0x24:"
 function keyLabel(i){
   const L=config&&config.layers&&config.layers[layer];
   if(!L)return "";
-  const r=Math.floor(i/15),c=i%15;
+  const [r,c]=rc(i);
   const cell=L[r]&&L[r][c];
   if(!cell)return "";
   return LEGEND[cell.kc]||kcName(cell.kc);
@@ -3325,7 +3445,7 @@ function wireBoard(root,mode){
   root.querySelectorAll(".kcap").forEach(el=>el.onclick=e=>{
     const i=+el.dataset.i;
     if(akEdit&&akSlot&&(akEdit.kind==="RS"||akEdit.kind==="SOCD")){
-      const r=Math.floor(i/15),c=i%15;
+      const [r,c]=rc(i);
       const kc=(config.layers?.[0]?.[r]?.[c]||{}).kc;
       if(akSlot==="key1"){akEdit.k1r=r;akEdit.k1c=c;akEdit.key1=kc;}
       else{akEdit.k2r=r;akEdit.k2c=c;akEdit.key2=kc;}
@@ -3346,7 +3466,7 @@ function wireBoard(root,mode){
   if(b("s-none"))b("s-none").onclick=selectNone;
 }
 function setFocus(i){
-  const r=Math.floor(i/15),c=i%15;
+  const [r,c]=rc(i);
   gaugeKey=i; gauge.reset();
   fetch("/api/focus",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({row:r,col:c})});
@@ -3697,7 +3817,7 @@ function pageHTML(){
 
   case "Performance": {
     const k=firstSel();
-    const key=k!==null?`${Math.floor(k/15)},${k%15}`:null;
+    const key=k!==null?rcKey(k):null;
     const a=key?((editDoc.actuation?.overrides_mm||{})[key]??editDoc.actuation?.default_mm??1.5)
                 :(editDoc.actuation?.default_mm??1.5);
     const rt=key?((editDoc.rapid_trigger?.overrides||{})[key]??editDoc.rapid_trigger?.default??{})
@@ -4460,7 +4580,7 @@ function wirePage(root){
     if(el("rt-on"))el("rt-on").onchange=()=>{
       el("rt-body").classList.toggle("dim",!el("rt-on").checked);gauge.reset();};
     on("perf-apply",async()=>{
-      const keys=targetKeys().map(i=>`${Math.floor(i/15)},${i%15}`);
+      const keys=targetKeys().map(rcKey);
       await patchProfile({
         actuation_keys:keys.map(k=>({key:k,mm:parseFloat(val("rt-act"))})),
         rt_keys:keys.map(k=>({key:k,enabled:chk("rt-on"),
