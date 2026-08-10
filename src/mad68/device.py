@@ -29,11 +29,7 @@ from .protocol import (
     DANGEROUS_COMMANDS,
     DANGEROUS_VENDOR,
     KEYCODE_SIZE,
-    KEYMAP_SIZE,
     KNOWN_PROTOCOL_VERSION,
-    LAYER_COUNT,
-    MATRIX_COLS,
-    MATRIX_ROWS,
     MAX_ACTUATION_READ,
     MAX_ACTUATION_WRITE,
     MAX_BUFFER_CHUNK,
@@ -43,7 +39,6 @@ from .protocol import (
     PRODUCT_ID,
     RAPID_TRIGGER_ENTRY_V2,
     REPORT_SIZE,
-    TOTAL_KEYS,
     USAGE,
     USAGE_PAGE,
     VENDOR_ID,
@@ -60,6 +55,8 @@ from .protocol import (
     build_vendor,
     decode_rgb,
     encode_rgb,
+    keymap_offset,
+    keymap_size,
     travel_bytes,
     travel_from_bytes,
 )
@@ -210,6 +207,16 @@ class Mad68:
     @property
     def matrix_cols(self) -> int:
         return self.spec.cols
+
+    @property
+    def layer_count_spec(self) -> int:
+        """Layers this board's matrix is packed for, from the registry."""
+        return self.spec.layers
+
+    @property
+    def keymap_size(self) -> int:
+        """Size of this board's dynamic keymap buffer, in bytes."""
+        return keymap_size(self.spec.rows, self.spec.cols, self.spec.layers)
 
     @property
     def firmware_version(self) -> int | None:
@@ -504,24 +511,34 @@ class Mad68:
     # keymap
 
     def read_keymap(self) -> bytes:
-        """The whole dynamic keymap: layers x rows x cols x 2 bytes."""
-        return self.read_buffer(Cmd.DYNAMIC_KEYMAP_GET_BUFFER, KEYMAP_SIZE)
+        """The whole dynamic keymap: layers x rows x cols x 2 bytes.
+
+        Sized from the connected board. A 60% board's buffer is 560 bytes, not
+        the 600 of the 65% this driver was written against, and the two are not
+        interchangeable: the row stride differs, so every row after the first
+        would decode one column out of place.
+        """
+        return self.read_buffer(Cmd.DYNAMIC_KEYMAP_GET_BUFFER, self.keymap_size)
 
     def write_keymap(self, data: bytes) -> None:
-        if len(data) != KEYMAP_SIZE:
-            raise ValueError(f"keymap must be {KEYMAP_SIZE} bytes, got {len(data)}")
+        want = self.keymap_size
+        if len(data) != want:
+            raise ValueError(
+                f"keymap for the {self.spec.name} must be {want} bytes "
+                f"({self.spec.layers} layers x {self.spec.rows} x "
+                f"{self.spec.cols} x {KEYCODE_SIZE}), got {len(data)}"
+            )
         self.write_buffer(Cmd.DYNAMIC_KEYMAP_SET_BUFFER, data)
 
-    @staticmethod
-    def keymap_index(layer: int, row: int, col: int) -> int:
+    def keymap_index(self, layer: int, row: int, col: int) -> int:
         """Byte offset of one keycode inside the flat keymap buffer."""
-        if not 0 <= layer < LAYER_COUNT:
+        if not 0 <= layer < self.spec.layers:
             raise ValueError(f"layer {layer} out of range")
-        if not 0 <= row < MATRIX_ROWS:
+        if not 0 <= row < self.matrix_rows:
             raise ValueError(f"row {row} out of range")
-        if not 0 <= col < MATRIX_COLS:
+        if not 0 <= col < self.matrix_cols:
             raise ValueError(f"col {col} out of range")
-        return ((layer * MATRIX_ROWS + row) * MATRIX_COLS + col) * KEYCODE_SIZE
+        return keymap_offset(layer, row, col, self.matrix_rows, self.matrix_cols)
 
     def read_keycode(self, layer: int, row: int, col: int) -> int:
         r = self.cmd(Cmd.DYNAMIC_KEYMAP_GET_KEYCODE, bytes([layer, row, col]))
@@ -576,8 +593,8 @@ class Mad68:
         self.vendor_set(Vendor.ONE_RT, payload)
 
     def iter_keys(self) -> Iterator[tuple[int, int]]:
-        for row in range(MATRIX_ROWS):
-            for col in range(MATRIX_COLS):
+        for row in range(self.matrix_rows):
+            for col in range(self.matrix_cols):
                 yield row, col
 
     # HE features, bulk
@@ -592,9 +609,12 @@ class Mad68:
     #
     # size counts keys. Offsets are linear key indices (row * cols + col).
 
-    @staticmethod
-    def key_index(row: int, col: int) -> int:
-        return row * MATRIX_COLS + col
+    def key_index(self, row: int, col: int) -> int:
+        return row * self.matrix_cols + col
+
+    def key_rowcol(self, index: int) -> tuple[int, int]:
+        """Inverse of key_index: linear key index back to (row, col)."""
+        return divmod(index, self.matrix_cols)
 
     def _bulk_request(self, sub: Vendor, offset: int, count: int) -> bytes:
         payload = bytearray(MAX_PAYLOAD)
@@ -641,11 +661,11 @@ class Mad68:
                 )
             for i in range(want):
                 e = data[i * 5:i * 5 + 5]
-                idx = base + i
+                row, col = self.key_rowcol(base + i)
                 out.append(
                     RapidTrigger(
-                        row=idx // MATRIX_COLS,
-                        col=idx % MATRIX_COLS,
+                        row=row,
+                        col=col,
                         enabled=bool(e[0]),
                         release_mm=travel_from_bytes(e[1:3]),
                         press_mm=travel_from_bytes(e[3:5]),
@@ -751,7 +771,8 @@ class Mad68:
     def read_trip_mm(self, row: int, col: int) -> float:
         """Live travel for one key, in millimetres.
 
-        One packet, so it can be polled fast enough to drive a travel gauge, a full 75-key sweep caps out around 20 Hz, which visibly steps.
+        One packet, so it can be polled fast enough to drive a travel gauge, a
+        full-matrix sweep caps out around 20 Hz, which visibly steps.
         """
         p = self.vendor_get(Vendor.REALTIME_TRIP_AXLE, bytes([row, col])).payload
         return round(int.from_bytes(p[4:6], "big") * 0.01, 2)
@@ -764,10 +785,14 @@ class Mad68:
     def populated_mask(self) -> list[bool]:
         """Which matrix positions actually have a switch, cached per handle.
 
-        A 68-key board in a 5x15 matrix leaves 7 positions empty. Those have no
+        No board in this family fills its matrix: a 68-key board leaves 7 of its
+        75 positions empty, a 61-key 60% board leaves 9 of its 70. Those have no
         sensor and no LED: their calibration flag is clear and their colour
         always reads back black no matter what is written. Anything diffing
         per-key state has to skip them or it will never converge.
+
+        This is also the only authority on which physical key sits where, so
+        the UI's drawn layout is checked against it rather than assumed.
         """
         if getattr(self, "_populated", None) is None:
             try:
@@ -932,7 +957,8 @@ class Mad68:
         while len(out) < self.total_keys:
             idx = len(out)
             want = min(self.MAX_RGB_PER_PACKET, self.total_keys - idx)
-            out.extend(self.read_key_colors(idx // MATRIX_COLS, idx % MATRIX_COLS, want))
+            row, col = self.key_rowcol(idx)
+            out.extend(self.read_key_colors(row, col, want))
         return out[:self.total_keys]
 
     def write_all_key_colors(self, colors: list[tuple[int, int, int]]) -> int:
@@ -940,7 +966,8 @@ class Mad68:
         i = 0
         while i < min(len(colors), self.total_keys):
             chunk = colors[i:i + self.MAX_RGB_PER_PACKET]
-            self.write_key_colors(i // MATRIX_COLS, i % MATRIX_COLS, chunk)
+            row, col = self.key_rowcol(i)
+            self.write_key_colors(row, col, chunk)
             packets += 1
             i += len(chunk)
         return packets
