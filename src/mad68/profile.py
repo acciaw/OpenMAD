@@ -6,13 +6,14 @@ differ.
 
 That minimal-diff behaviour is not just an optimisation. Vendor writes land in
 the keyboard's non-volatile memory, which has a finite erase/write endurance. A
-naive "write all 75 keys on every app switch" design would burn through that,
-so apply() writes only genuine changes and reports exactly how many writes it
-issued.
+naive "write the whole matrix on every app switch" design would burn through
+that, so apply() writes only genuine changes and reports exactly how many
+writes it issued.
 
 Profiles store actuation and rapid trigger as a default plus sparse
-overrides, which is both far more readable than 75 rows and much cheaper to
-diff.
+overrides, which is both far more readable than one row per key and much
+cheaper to diff. It also makes a profile portable between boards of different
+widths, which the flat per-key colour array is not -- see the note below.
 """
 
 from __future__ import annotations
@@ -48,6 +49,17 @@ from .protocol import (
     FlashOp,
 )
 
+# Profiles are geometry-independent on purpose.
+#
+# Actuation and rapid trigger are stored as a default plus 'row,col' overrides,
+# which means the same file describes a 5x14 board and a 5x15 one without
+# translation -- an override for 3,13 simply has no key to land on if the board
+# has no 3,13. Per-key colours are the exception: they are a flat array in
+# linear key order, and linear order depends on the column count. So they are
+# fitted to the connected board on the way out rather than assumed to match,
+# which is what stops a profile captured on a 68 from painting a 60's LEDs one
+# column further left on every row.
+
 # Advanced-key slots a profile snapshots. The firmware exposes them by index
 # with no count command, so this is a bounded sweep.
 ADVANCED_KEY_SLOTS = 16
@@ -72,6 +84,35 @@ PROFILE_VERSION = 2
 def _key(row: int, col: int) -> str:
     """Stable string key for JSON objects: 'r,c'."""
     return f"{row},{col}"
+
+
+def fit_key_colors(colors: Iterable, rows: int, cols: int) -> list[list[int]]:
+    """Re-lay a flat per-key colour array into a rows x cols matrix.
+
+    Per-key colours are stored in linear key order, so their meaning depends on
+    the column count of the board they came from. Every board in this family has
+    five rows (devices.py), so the source width is recoverable from the array
+    length, and the array can be re-indexed by (row, col) for a board of another
+    width. Columns the target does not have are dropped; columns it has and the
+    source did not come out black.
+
+    Without this, a profile captured on a 68 and applied to a 60 shifts every
+    row after the first one column to the left.
+    """
+    src = [[int(v) for v in list(c)[:3]] for c in colors]
+    total = rows * cols
+    src_cols = len(src) // rows if rows and len(src) % rows == 0 else cols
+    if src_cols != cols:
+        src = [
+            src[r * src_cols + c] if c < src_cols and r * src_cols + c < len(src)
+            else [0, 0, 0]
+            for r in range(rows)
+            for c in range(cols)
+        ]
+    # A truncated or hand-edited file still has to produce a full frame, or a
+    # write would leave the tail of the board untouched.
+    src += [[0, 0, 0]] * (total - len(src))
+    return src[:total]
 
 
 def _parse_key(text: str) -> tuple[int, int]:
@@ -157,12 +198,21 @@ class Profile:
     trigger_title: str | None = None
 
     # geometry helpers
+    #
+    # Every one of these takes the matrix from the connected board. Falling back
+    # to the module defaults only happens when there is no device to ask.
 
     @staticmethod
-    def all_keys() -> Iterable[tuple[int, int]]:
-        for row in range(MATRIX_ROWS):
-            for col in range(MATRIX_COLS):
+    def all_keys(rows: int = MATRIX_ROWS,
+                 cols: int = MATRIX_COLS) -> Iterable[tuple[int, int]]:
+        for row in range(rows):
+            for col in range(cols):
                 yield row, col
+
+    @staticmethod
+    def keys_of(kb: Mad68) -> list[tuple[int, int]]:
+        """Every matrix position on the connected board, in linear key order."""
+        return list(kb.iter_keys())
 
     def actuation_for(self, row: int, col: int) -> float:
         return self.actuation_overrides.get(_key(row, col), self.actuation_default)
@@ -271,7 +321,7 @@ class Profile:
                     include_lighting: bool = True, include_advanced: bool = True,
                     description: str = "") -> "Profile":
         """Snapshot the live device, choosing the most common value as default."""
-        keys = list(cls.all_keys())
+        keys = cls.keys_of(kb)
         actuation = dict(zip(keys, kb.read_actuation_bulk()))
         triggers = {
             (rt.row, rt.col): RapidTriggerSpec.from_device(rt)
@@ -318,20 +368,40 @@ class Profile:
 
     # target state
 
-    def target_actuation(self) -> list[float]:
-        """Desired actuation in mm for all 75 keys, in linear key order."""
-        return [self.actuation_for(r, c) for r, c in self.all_keys()]
+    def target_actuation(self, kb: Mad68) -> list[float]:
+        """Desired actuation in mm for every key on kb, in linear key order."""
+        return [self.actuation_for(r, c) for r, c in self.keys_of(kb)]
 
-    def target_rapid_trigger(self) -> list[RapidTrigger]:
-        """Desired rapid trigger for all 75 keys, in linear key order."""
+    def target_rapid_trigger(self, kb: Mad68) -> list[RapidTrigger]:
+        """Desired rapid trigger for every key on kb, in linear key order."""
         out = []
-        for row, col in self.all_keys():
+        for row, col in self.keys_of(kb):
             spec = self.rapid_trigger_for(row, col)
             out.append(
                 RapidTrigger(row=row, col=col, enabled=spec.enabled,
                              release_mm=spec.release_mm, press_mm=spec.press_mm)
             )
         return out
+
+    def target_key_colors(self, kb: Mad68) -> list[tuple[int, int, int]] | None:
+        """This profile's per-key colours in the connected board's key order."""
+        if self.key_colors is None:
+            return None
+        return [
+            (c[0], c[1], c[2])
+            for c in fit_key_colors(self.key_colors, kb.matrix_rows, kb.matrix_cols)
+        ]
+
+    def keymap_fits(self, kb: Mad68) -> bool:
+        """Whether this profile's stored keymap is for this board's matrix.
+
+        Unlike actuation and colours, a keymap cannot be sensibly translated
+        between geometries: which physical key sits on which matrix slot is a
+        property of the board, not something derivable from the buffer. So a
+        mismatched keymap is reported and skipped rather than reshaped.
+        """
+        return (self.keymap_hex is None
+                or len(self.keymap_hex) // 2 == kb.keymap_size)
 
     def keymap_status(self, kb: Mad68) -> dict:
         """Whether this profile's keymap matches what is on the keyboard.
@@ -343,6 +413,20 @@ class Profile:
         if self.keymap_hex is None:
             return {"has_keymap": False, "matches": True, "keys_differ": 0}
         want = bytes.fromhex(self.keymap_hex)
+        if len(want) != kb.keymap_size:
+            return {
+                "has_keymap": True,
+                "matches": False,
+                "keys_differ": 0,
+                "incompatible": True,
+                "reason": (
+                    f"this profile's key bindings were captured from a "
+                    f"{len(want) // (KEYCODE_SIZE * kb.spec.layers * kb.matrix_rows)}"
+                    f"-column board, and the {kb.spec.name} has "
+                    f"{kb.matrix_cols}. Key bindings cannot be moved between "
+                    f"board sizes, so they will not be applied."
+                ),
+            }
         have = kb.read_keymap()
         if have == want:
             return {"has_keymap": True, "matches": True, "keys_differ": 0}
@@ -363,6 +447,8 @@ class Profile:
         if self.keymap_hex is None:
             return 0
         want = bytes.fromhex(self.keymap_hex)
+        if len(want) != kb.keymap_size:
+            raise ValueError(self.keymap_status(kb)["reason"])
         if kb.read_keymap() == want:
             return 0
         kb.write_keymap(want)
@@ -371,9 +457,10 @@ class Profile:
     def plan(self, kb: Mad68, *, include_keymap: bool = False) -> "ApplyPlan":
         """Diff this profile against the live device using bulk reads.
 
-        Whole-array comparison rather than per-key: a bulk write of all 75 keys
-        costs 26 packets and ~12 ms, so there is nothing to gain from writing a
-        subset, and with FlashOp.NORMAL it costs no write endurance either.
+        Whole-array comparison rather than per-key: a bulk write of the whole
+        matrix costs ~26 packets and ~12 ms, so there is nothing to gain from
+        writing a subset, and with FlashOp.NORMAL it costs no write endurance
+        either.
 
         The keymap is the exception and is left out unless asked for. Actuation,
         rapid trigger and lighting all ride the vendor channel and can be
@@ -388,8 +475,8 @@ class Profile:
         """
         have_act = kb.read_actuation_bulk()
         have_rt = kb.read_rapid_trigger_bulk()
-        want_act = self.target_actuation()
-        want_rt = self.target_rapid_trigger()
+        want_act = self.target_actuation(kb)
+        want_rt = self.target_rapid_trigger(kb)
 
         act_changes = sum(
             1 for a, b in zip(have_act, want_act) if abs(a - b) > 1e-9
@@ -399,12 +486,14 @@ class Profile:
         keymap = None
         if include_keymap and self.keymap_hex is not None:
             want_keymap = bytes.fromhex(self.keymap_hex)
-            if kb.read_keymap() != want_keymap:
+            # A keymap for a different matrix is skipped rather than written;
+            # see keymap_fits. keymap_status is what tells the user why.
+            if len(want_keymap) == kb.keymap_size and kb.read_keymap() != want_keymap:
                 keymap = want_keymap
 
         key_colors = None
-        if self.key_colors is not None:
-            want_kc = [tuple(c) for c in self.key_colors]
+        want_kc = self.target_key_colors(kb)
+        if want_kc is not None:
             # Reading per-key colour returns the LIVE rendered frame, not the
             # stored setpoint. While an animation effect runs those values change
             # constantly, so comparing them would report a difference on every
@@ -416,7 +505,7 @@ class Profile:
                     have = kb.read_all_key_colors()
                     live = kb.populated_mask()
                     # Two reasons a naive comparison never converges: the LEDs
-                    # quantise PWM (a written 40 reads back as 36), and the 7
+                    # quantise PWM (a written 40 reads back as 36), and the
                     # unpopulated matrix positions have no LED at all so they
                     # always read black. Allow slack, and skip the dead slots.
                     if len(have) != len(want_kc) or any(
@@ -545,7 +634,7 @@ class Profile:
 class ApplyPlan:
     """What must be written to bring the device to a profile.
 
-    actuation / rapid_trigger hold the full 75-key target arrays when a bulk
+    actuation / rapid_trigger hold the full-matrix target arrays when a bulk
     write is needed, or None when the device already matches.
     """
 
@@ -693,6 +782,8 @@ def default_profile(name: str = DEFAULT_PROFILE_NAME) -> Profile:
         rapid_trigger_default=RapidTriggerSpec(
             enabled=False, press_mm=0.50, release_mm=0.50),
         rapid_trigger_overrides={},
+        # Written at the default geometry; target_key_colors() re-lays it out
+        # for whatever board it is applied to. All-black survives that intact.
         key_colors=[[0, 0, 0] for _ in range(TOTAL_KEYS)],
         light={"effect": 0, "speed": 0, "r": 0, "g": 0, "b": 0, "brightness": 0},
         advanced_keys=[
