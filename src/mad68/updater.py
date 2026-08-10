@@ -12,9 +12,20 @@ Shape of it:
                                replace the executable we are running from
 
 The last step is the awkward one. Windows will not overwrite a running .exe, so
-the app has to be gone before the installer reaches the file-copy stage. The
-installer is therefore spawned detached, and the app shuts itself down straight
-after; packaging/mad68.iss relaunches it when a silent install finishes.
+the app has to be gone before the installer reaches the file-copy stage -- and
+Inno gets there about two tenths of a second after it starts, which is long
+before a shutdown finishes.
+
+So the app does not launch the installer at all. It writes a small batch
+launcher, hands it the installer path and its own PID, and starts it in the
+background; the launcher waits for that PID to disappear and only then runs the
+installer. The app then shuts itself down. packaging/mad68.iss relaunches it
+when the silent install finishes.
+
+Progress is recorded in two files next to the download: launcher.log (did the
+launcher run, did it see the app exit, what did the installer return) and
+install.log (Inno's own). The failure this replaced was silent in both, which
+is why the first of those exists.
 
 What is trusted here, and what is not: the release metadata comes from the
 GitHub API over TLS, the download must stay on GitHub's own hosts across every
@@ -32,6 +43,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
@@ -47,6 +59,73 @@ _ALLOWED_HOSTS = {"github.com", "api.github.com", "objects.githubusercontent.com
 _INSTALLER_RE = re.compile(r"^[\w.-]+-Setup-[\d.]+\.exe$", re.IGNORECASE)
 
 _CHUNK = 64 * 1024
+
+# The launcher that actually starts the installer, and how it is built.
+#
+# It is a file on disk with no paths baked into it: the installer, the log and
+# the PID to wait for all arrive as arguments. That is not tidiness, it is the
+# whole point.
+#
+#   Quoting. subprocess quotes list arguments the way the C runtime parses
+#   them, so a quote inside an argument is escaped as \". cmd.exe does not use
+#   those rules -- it takes the backslash literally. Building one long command
+#   string and handing it to `cmd /c` therefore produced
+#       '\"C:\...\OpenMAD-Setup-1.1.2.exe\"' is not recognized as an internal
+#       or external command
+#   and the installer never ran, on every machine, regardless of the path. The
+#   app quit anyway, because quitting is on a timer that does not know whether
+#   the launch worked -- so from outside it looked like "it downloads the
+#   update and then just closes itself". Arguments passed as separate list
+#   entries are quoted plainly and survive intact.
+#
+#   Encoding. A batch file is read in the console's OEM code page, so a path
+#   with a non-ASCII character in it (a user name with an accent) would be
+#   mangled if it were written into the script. As an argument it never is.
+#
+#   Expansion. `%` is legal in a Windows path and cmd expands it even inside
+#   quotes. Arguments are not re-expanded, so that cannot bite either.
+#
+# The wait is on the app's PID rather than a fixed sleep. Windows will not
+# overwrite a running executable, and Inno reaches its in-use check about two
+# tenths of a second after launch, so the installer must not start before the
+# app is gone -- but a sleep long enough to be safe is also a sleep the user
+# sits through, and any fixed number is wrong for a shutdown that stalls.
+_LAUNCHER_NAME = "install-update.cmd"
+
+# ~1s per iteration (ping -n 2). The cap is a backstop for an app that never
+# exits; CloseApplications=force in packaging/mad68.iss is the one after that.
+_LAUNCHER_MAX_TRIES = 120
+
+# How long to wait for the launcher to prove it is running before giving up and
+# leaving the app open. It writes its log immediately, so this only has to
+# cover process creation.
+_LAUNCH_CONFIRM_S = 5.0
+
+# `ping` rather than `timeout`, which needs a console this deliberately lacks.
+# `tasklist | find` is a pipe between two console programs, which is why the
+# launch below uses CREATE_NO_WINDOW (a console, just not a visible one) and
+# not DETACHED_PROCESS (no console at all, under which the pipe dies silently
+# and the launcher stops at its first line).
+_LAUNCHER_CMD = (
+    "@echo off\r\n"
+    "rem OpenMAD update launcher, written by the app. Safe to delete.\r\n"
+    "rem %1 installer  %2 installer log  %3 PID to wait for  %4 max tries\r\n"
+    'echo [%DATE% %TIME%] waiting for PID %~3 > "%~dp0launcher.log"\r\n'
+    "set TRIES=0\r\n"
+    ":wait\r\n"
+    'tasklist /FI "PID eq %~3" /NH 2>nul | find "%~3" >nul\r\n'
+    "if errorlevel 1 goto run\r\n"
+    "set /a TRIES+=1\r\n"
+    "if %TRIES% GEQ %~4 goto run\r\n"
+    "ping -n 2 127.0.0.1 >nul\r\n"
+    "goto wait\r\n"
+    ":run\r\n"
+    'echo [%DATE% %TIME%] app gone after %TRIES%s, starting installer'
+    ' >> "%~dp0launcher.log"\r\n'
+    "%1 /SILENT /SUPPRESSMSGBOXES /NORESTART /LOG=%2\r\n"
+    'echo [%DATE% %TIME%] installer exit code %ERRORLEVEL%'
+    ' >> "%~dp0launcher.log"\r\n'
+)
 
 
 def _host_allowed(url: str) -> bool:
@@ -85,6 +164,16 @@ def _download_dir() -> Path:
     d = Path(tempfile.gettempdir()) / "OpenMAD-update"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _wait_for_file(path: Path, timeout_s: float) -> bool:
+    """Whether path appears within timeout_s. Used to confirm a spawn took."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(0.05)
+    return path.exists()
 
 
 class Updater:
@@ -221,28 +310,25 @@ class Updater:
             installer = self.path
             self.state = "installing"
 
-        log = _download_dir() / "install.log"
+        d = _download_dir()
+        log = d / "install.log"
+        launcher = d / _LAUNCHER_NAME
+        launcher_log = d / "launcher.log"
 
-        # The installer has to start *after* this process is gone, not
-        # alongside it.
-        #
-        # Inno reaches its in-use check about two tenths of a second after
-        # launch, while this process does not exit until the caller's shutdown
-        # completes. Launching it directly meant the running executable was
-        # always still holding OpenMAD.exe when Inno looked, and the install
-        # was abandoned and rolled back before the app had even begun to close.
-        #
-        # So the launch is handed to a detached `cmd` that sleeps first. `ping`
-        # rather than `timeout`, because `timeout` needs a console and this
-        # deliberately has none. The delay is the ordinary path; `force` in the
-        # .iss is the safety net for a shutdown that takes longer than this.
-        delay_s = 5
-        cmd = (f'ping -n {delay_s + 1} 127.0.0.1 >nul & '
-               f'"{installer}" /SILENT /SUPPRESSMSGBOXES /NORESTART /LOG="{log}"')
+        # Rewritten every time rather than only when missing, so a launcher
+        # left behind by an older version is never the one that runs.
+        launcher.write_text(_LAUNCHER_CMD, encoding="ascii", newline="")
+        launcher_log.unlink(missing_ok=True)
+
+        # See _LAUNCHER_CMD for why this is a script file taking arguments and
+        # not a command string, and why CREATE_NO_WINDOW rather than
+        # DETACHED_PROCESS. The launcher outlives this process on purpose.
+        argv = [str(launcher), str(installer), str(log),
+                str(os.getpid()), str(_LAUNCHER_MAX_TRIES)]
         try:
             subprocess.Popen(
-                ["cmd", "/c", cmd],
-                creationflags=(subprocess.DETACHED_PROCESS
+                argv,
+                creationflags=(subprocess.CREATE_NO_WINDOW
                                | subprocess.CREATE_NEW_PROCESS_GROUP),
                 close_fds=True,
             )
@@ -250,11 +336,32 @@ class Updater:
             self._set(state="error", error=f"could not start the installer: {exc}")
             raise
 
+        # Never quit on the strength of a Popen that returned without error.
+        #
+        # Popen succeeding only means a process was created; it says nothing
+        # about whether the launcher got as far as being able to run the
+        # installer. The bug this replaced failed exactly there -- the process
+        # started, cmd rejected the command line, and the app quit anyway, so
+        # the user saw the app vanish with no update and nothing to read.
+        #
+        # Writing its log is the launcher's first action, so its appearance is
+        # proof the script is executing. Without it, stay open and say so.
+        if not _wait_for_file(launcher_log, _LAUNCH_CONFIRM_S):
+            msg = ("the update launcher did not start, so the app has not been "
+                   "closed. The downloaded installer can be run by hand: "
+                   f"{installer}")
+            self._set(state="error", error=msg)
+            raise RuntimeError(msg)
+
         # Quitting is the caller's job, and it has to happen: the installer
-        # cannot replace OpenMAD.exe while this process still has it open.
+        # cannot replace OpenMAD.exe while this process still has it open. The
+        # launcher is watching this PID, so the sooner this returns the sooner
+        # the install starts.
         if on_exit is not None:
             threading.Timer(1.0, on_exit).start()
-        return {"installing": True, "log": str(log)}
+        return {"installing": True, "log": str(log),
+                "launcher_log": str(launcher_log),
+                "installer": str(installer)}
 
 
 # One per process, shared by every request handler.
