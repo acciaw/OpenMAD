@@ -225,12 +225,26 @@ attached and every button in that section was dead.
 
 ## Compatibility
 
-Written for and tested on the MAD68 HE, USB `0x373B:0x1058` ("MAD 68 RGB").
+Confirmed on hardware, reading and writing:
 
-The `DuckBread` controller backs several other boards in the same family
-(MAD60 HE, MAD68 HE V2, MAD63 HE and others). Much of this would likely work on
-them, but the matrix size and LED count are hardcoded and nothing else has been
-tested. Take a backup first.
+| Board | USB | Matrix |
+| --- | --- | --- |
+| MAD68 HE RGB | `0x373B:0x1058` | 5 × 15, 68 keys |
+| MAD60 HE | `0x373B:0x1053` | 5 × 14, 61 keys |
+
+The `DuckBread` controller backs 25 boards in the same family — see
+[`src/mad68/devices.py`](src/mad68/devices.py) for the full list, taken from
+the vendor's own registry. They share the packet layouts, vendor sub-commands
+and flash semantics; only the matrix geometry differs, and the driver reads
+that from the board it is talking to rather than assuming one.
+
+A board that is not on the confirmed list opens **read-only**. It can be
+inspected, diagnosed and reported on safely, but nothing can write to it until
+its firmware reports a protocol version this driver was built against *and*
+someone has actually run it on that model. Sending a board report from Other
+Settings is what moves a board onto the list.
+
+Take a backup first.
 
 Not affiliated with, endorsed by, or supported by the manufacturer.
 
